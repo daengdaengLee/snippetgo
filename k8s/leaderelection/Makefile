@@ -9,8 +9,8 @@ CLUSTER   ?= snippetgo-le
 # (매니페스트가 source of truth). 이 변수만 바꿔도 배포 위치는 옮겨지지 않는다.
 NAMESPACE  ?= snippetgo-leaderelection
 LEASE_NAME ?= snippetgo-leaderelection
-# 리더직 상실 처리 방식(exit | rejoin). deploy 가 Deployment 에 주입한다.
-MODE       ?= exit
+# 배포할 kustomize 디렉터리. base 는 exit, overlays/rejoin 은 rejoin 모드.
+KUSTOMIZE_DIR ?= manifests
 # 바이너리는 kind 노드(리눅스) 에서 돌므로 GOOS 는 linux 로 고정하고
 # GOARCH 는 호스트에 맞춰 kind 노드 아키텍처와 일치시킨다.
 GOARCH    ?= $(shell go env GOARCH)
@@ -43,11 +43,8 @@ load: ## 빌드한 이미지를 kind 노드에 적재
 	kind load docker-image $(IMAGE) --name $(CLUSTER)
 
 .PHONY: deploy
-deploy: ## 네임스페이스/RBAC/Deployment(MODE 렌더) 적용 후 롤아웃 대기
-	kubectl apply -f manifests/namespace.yaml -f manifests/rbac.yaml
-	# deployment.yaml 을 단일 source of truth 로 두고 MODE 만 렌더해 한 번만 적용한다
-	# (value: exit 은 LE_MODE 에만 있는 유일 문자열. MODE=exit 이면 no-op 치환).
-	sed 's/value: exit/value: $(MODE)/' manifests/deployment.yaml | kubectl apply -f -
+deploy: ## kustomize 로 배포(KUSTOMIZE_DIR) 후 롤아웃 대기
+	kubectl apply -k $(KUSTOMIZE_DIR)
 	kubectl -n $(NAMESPACE) rollout status deploy/leaderelection --timeout=90s
 
 .PHONY: status
@@ -70,15 +67,15 @@ kill-leader: ## 현재 리더 Pod 를 삭제해 failover 유도
 	kubectl -n $(NAMESPACE) delete pod "$$leader"
 
 .PHONY: demo
-demo: kind-down kind-up docker-build load deploy ## 정리 -> 구축 -> 빌드/적재 -> 배포(MODE=exit 기본)
+demo: kind-down kind-up docker-build load deploy ## 정리 -> 구축 -> 빌드/적재 -> 배포(base=exit)
 	@echo ""
-	@echo "배포 완료(mode=$(MODE)). 리더를 관찰하려면: make logs"
+	@echo "배포 완료. 리더를 관찰하려면: make logs"
 	@echo "현재 리더 확인:        make leader"
 	@echo "failover 실험:         make kill-leader"
 
 .PHONY: demo-rejoin
-demo-rejoin: ## demo 를 rejoin 모드로 실행(리더직 상실 시 in-process 재경쟁)
-	$(MAKE) demo MODE=rejoin
+demo-rejoin: ## demo 를 rejoin overlay 로 실행(리더직 상실 시 in-process 재경쟁)
+	$(MAKE) demo KUSTOMIZE_DIR=manifests/overlays/rejoin
 
 .PHONY: clean
 clean: kind-down ## 클러스터와 빌드 산출물 정리

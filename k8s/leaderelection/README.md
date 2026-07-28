@@ -93,8 +93,8 @@ func RunUntilCancelled(ctx context.Context, client kubernetes.Interface, cfg Con
 
 리더 선출의 핵심은 세 타이밍 값의 관계다. `RenewDeadline < LeaseDuration` 이어야 하고,
 `RenewDeadline` 은 단순히 `RetryPeriod` 보다 큰 게 아니라 **`RetryPeriod * JitterFactor(1.2)`
-보다** 커야 한다. `validate` 가 client-go `NewLeaderElector` 와 똑같은 식을 미리 검사해,
-어기면 클라이언트 생성 전에 명확한 에러를 낸다(함정 2 참고).
+보다** 커야 한다. 이 관계식은 client-go `NewLeaderElector` 가 검사하고, 어기면 `Run` 이 그
+에러를 그대로 반환한다(함정 2 참고).
 
 | 값 | 의미 | 크면 | 작으면 |
 | --- | --- | --- | --- |
@@ -112,15 +112,16 @@ func RunUntilCancelled(ctx context.Context, client kubernetes.Interface, cfg Con
 | 명령 | 하는 일 |
 | --- | --- |
 | `make demo` | 기존 클러스터 정리 -> kind 생성 -> 이미지 빌드/적재 -> 배포 (`exit` 모드) |
-| `make demo-rejoin` | 위와 같되 `rejoin` 모드로 배포 (`make demo MODE=rejoin` 과 동일) |
+| `make demo-rejoin` | 위와 같되 rejoin overlay 로 배포 |
 | `make logs` | 모든 Pod 로그 실시간(리더 관찰) |
 | `make status` | Lease 1 개와 Pod 3 개 상태 |
 | `make leader` | 현재 리더(`Lease.holderIdentity`) 출력 |
 | `make kill-leader` | 현재 리더 Pod 삭제 -> failover 유도 |
 | `make clean` | 클러스터/바이너리 정리 |
 
-`MODE` 는 리더직 상실 처리 방식을 고른다(`exit` 기본 | `rejoin`). `deploy` 가 `kubectl set env`
-로 Deployment 의 `LE_MODE` 에 주입한다.
+리더직 상실 처리 방식(`LE_MODE`)은 kustomize 로 고른다. base(`manifests`)는 `exit`,
+`manifests/overlays/rejoin` overlay 가 `rejoin` 으로 덮어쓴다. `make deploy` 는
+`kubectl apply -k $(KUSTOMIZE_DIR)` 로 배포하고, `make demo-rejoin` 은 overlay 를 가리킨다.
 
 배포 후 Lease 를 보면 한 Pod 가 홀더로 잡혀 있다:
 
@@ -162,17 +163,19 @@ pod "leaderelection-6c9d4f8b7-abcde" deleted
 
 ## 매니페스트 / RBAC
 
-`manifests/` 는 세 조각이다.
+`manifests/` 는 base(namespace/rbac/deployment)와 kustomization, 그리고 `overlays/rejoin`
+overlay 로 구성된다.
 
 - `namespace.yaml` - 전용 네임스페이스 `snippetgo-leaderelection`.
 - `rbac.yaml` - ServiceAccount + Role + RoleBinding. Role 은 **`coordination.k8s.io` 의
-  `leases` 에 대한 권한만** 준다(`get,list,watch,create,update,patch`). 리더 선출은
-  Lease 를 만들고 자기 것으로 갱신하며 남의 상태를 볼 뿐이라, 그 외 권한은 필요 없다. 반납
-  (`ReleaseOnCancel`) 도 홀더를 비우는 `update` 라서 `delete` 조차 필요 없다. 이 스니펫은
-  `EventRecorder` 를 쓰지 않으므로 `events` 권한도 필요 없다.
+  `leases` 에 대해 `get,create,update` 만** 준다. `resourcelock.LeaseLock` 은 단일 Lease 를
+  get(확인)/create(최초)/update(갱신,반납)할 뿐 list/watch/patch/delete 를 쓰지 않는다.
+  `EventRecorder` 도 안 써서 `events` 권한 역시 필요 없다.
 - `deployment.yaml` - `replicas: 3`. Downward API 로 `POD_NAME`/`POD_NAMESPACE` 를 주입해
   identity 로 쓴다. 이미지는 `imagePullPolicy: IfNotPresent`(kind 로 노드에 직접 적재),
   distroless nonroot 와 맞춘 `securityContext`(비루트, 읽기 전용 루트 FS).
+- `kustomization.yaml` + `overlays/rejoin/` - `LE_MODE` 만 `rejoin` 으로 바꾸는 overlay.
+  `kubectl apply -k manifests`(exit) / `kubectl apply -k manifests/overlays/rejoin`(rejoin).
 
 이미지는 로컬에서 `go build` 한 정적 바이너리를 `Dockerfile` 이 복사만 한다(빌드는 Makefile,
 런타임은 `gcr.io/distroless/static:nonroot`).
@@ -185,12 +188,13 @@ pod "leaderelection-6c9d4f8b7-abcde" deleted
 둘일 수 있다**. 진짜로 "절대 동시에 둘이면 안 되는" 자원은 리더 신분과 별개로 fencing 을 걸어야
 한다(예: 쓰기 시 리소스 버전/펜싱 토큰 검증). 리더 선출은 "대부분의 시간에 하나" 를 보장할 뿐이다.
 
-### 2. 타이밍 검증은 JitterFactor 까지 미러링한다 - 구현됨
+### 2. 타이밍 검증은 client-go 가 최종 권위 - 위임
 
-`validate` 는 `LeaseDuration > RenewDeadline` 뿐 아니라
-`RenewDeadline > RetryPeriod * JitterFactor(1.2)` 까지, client-go `NewLeaderElector` 가 강제하는
-것과 **정확히 같은 식**을 검사한다. 예를 들어 `RetryPeriod=9s, RenewDeadline=10s` 는 단순
-대소로는 통과하지만 `1.2*9=10.8s >= 10s` 라 거부된다. 클라이언트 생성 전에 명확한 에러를 준다.
+타이밍 관계식(`LeaseDuration > RenewDeadline`, `RenewDeadline > RetryPeriod * JitterFactor(1.2)`)은
+client-go `NewLeaderElector` 가 강제한다. 예를 들어 `RetryPeriod=9s, RenewDeadline=10s` 는 단순
+대소로는 통과하지만 `1.2*9=10.8s >= 10s` 라 거부된다. 이 래퍼의 `validate` 는 기본값으로 못
+채우는 필수 필드(Namespace/LeaseName/Identity)만 확인하고, 타이밍은 중복 검사하지 않는다 -
+어긋나면 `NewLeaderElector` 의 에러가 `Run` 을 통해 그대로 나온다(단일 권위, 상수 변경에도 자동 정합).
 
 ### 3. `ReleaseOnCancel` 로 빠른 failover - 구현됨
 
@@ -208,10 +212,10 @@ API 의 `metadata.name`(Pod 이름) 을 `POD_NAME` 으로 주입해 쓴다. `cmd
 
 리더 전용 작업은 콜백으로 넘어온 `ctx` 가 취소되면(리더직 상실/종료) **반드시 멈춰야 한다**.
 멈추지 않으면 리더가 바뀐 뒤에도 옛 리더가 작업을 계속해 함정 1 을 악화시킨다. `cmd/main.go` 의
-`runLeaderWork` 는 `ticker` 루프에서 `ctx.Done()` 을 항상 확인하고, 작업 직전에도 한 번 더
-우선 확인한다. 다만 client-go 가 `OnStartedLeading` 을 detached 고루틴으로 띄우므로, rejoin
-모드에서 같은 Pod 가 상실 직후 재획득하면 이전 작업 고루틴이 완전히 끝나기 전 새 고루틴과 아주
-짧게 겹칠 수 있다. 실전 싱글톤 작업이라면 이 창까지 감안해 멱등성/펜싱을 두는 게 안전하다.
+`runLeaderWork` 는 `ticker` 루프에서 `ctx.Done()` 을 항상 확인한다. 다만 client-go 가
+`OnStartedLeading` 을 detached 고루틴으로 띄우므로, rejoin 모드에서 같은 Pod 가 상실 직후
+재획득하면 이전 작업 고루틴이 완전히 끝나기 전 새 고루틴과 아주 짧게 겹칠 수 있다. 이 겹침은
+코드로 완전히 없앨 수 없으니, 실전 싱글톤 작업이라면 멱등성/펜싱으로 중복 수행을 흡수해야 한다.
 
 ### 6. 리더직 상실 처리: exit vs rejoin - 구현됨
 

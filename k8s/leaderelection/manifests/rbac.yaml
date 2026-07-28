@@ -1,6 +1,7 @@
-# 리더 선출은 Lease 오브젝트를 만들고(create) 자기 것으로 갱신(update/patch)하며
-# 남의 임대 상태를 확인(get/list/watch)한다. 그래서 coordination.k8s.io 의 leases 에
-# 대한 권한만 있으면 되고, 그 외 권한은 필요 없다(EventRecorder 를 안 써서 events 도 불필요).
+# 리더 선출(resourcelock.LeaseLock)은 단일 Lease 오브젝트에 대해 get(상태 확인)/
+# create(최초 생성)/update(갱신, 반납) 만 한다. list/watch/patch 는 쓰지 않으므로 넣지 않는다.
+# coordination.k8s.io 의 leases 에 대한 이 세 권한만 있으면 되고, EventRecorder 를 안 써서
+# events 권한도 필요 없다.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -15,9 +16,7 @@ metadata:
 rules:
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]
-    # 리더 선출은 Lease 를 삭제하지 않는다. 반납(ReleaseOnCancel) 도 홀더를 비우는
-    # update 라서 delete 권한은 필요 없다(최소 권한 유지).
-    verbs: ["get", "list", "watch", "create", "update", "patch"]
+    verbs: ["get", "create", "update"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

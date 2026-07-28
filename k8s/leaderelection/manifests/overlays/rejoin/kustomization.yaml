@@ -1,0 +1,8 @@
+# rejoin overlay: base 를 그대로 쓰되 LE_MODE 만 rejoin 으로 바꾼다.
+# 배포: kubectl apply -k manifests/overlays/rejoin
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../
+patches:
+  - path: patch-mode.yaml

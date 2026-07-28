@@ -19,6 +19,7 @@ package leaderelection
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -73,8 +74,9 @@ type Config struct {
 	// 이 ctx 를 존중해 종료해야 한다. 이 함수는 블록해도 되고, 반환하거나 ctx 가
 	// 취소되면 리더 작업이 끝난 것으로 본다.
 	OnStartedLeading func(ctx context.Context)
-	// OnStoppedLeading 은 리더직을 잃었을 때(갱신 실패, ctx 취소 등) 호출된다.
-	// 리더 전용 자원을 정리하는 자리다.
+	// OnStoppedLeading 은 이 인스턴스가 실제로 리더였다가 그 자리를 잃었을 때(갱신 실패,
+	// ctx 취소 등) 호출된다. 리더가 된 적 없는 팔로워에서는 호출되지 않는다. 리더 전용
+	// 자원을 정리하는 자리다.
 	OnStoppedLeading func()
 	// OnNewLeader 는 관찰된 리더가 바뀔 때마다 호출된다(자기 자신이 리더가 된
 	// 경우 포함). 로깅/관측용으로 유용하다.
@@ -96,20 +98,14 @@ func (c Config) applyDefaults() Config {
 	return c
 }
 
-// validate 는 기본값으로 못 채우는 필수 값과 타이밍 관계식을 확인한다.
+// validate 는 기본값으로 못 채우는 필수 값만 확인한다.
 //
-// 타이밍 검사는 client-go 의 NewLeaderElector 가 강제하는 것과 정확히 같은 식을 쓴다.
-// 특히 RenewDeadline 은 단순히 RetryPeriod 보다 큰 정도가 아니라 JitterFactor(=1.2) 를
-// 곱한 값보다 커야 한다. 미리 걸러 클라이언트 생성 전에 명확한 에러를 준다.
+// 타이밍 관계식(RetryPeriod < RenewDeadline < LeaseDuration, JitterFactor 포함) 은
+// client-go NewLeaderElector 가 최종 권위이므로 여기서 중복 검사하지 않는다. 어긋나면
+// Run 안의 NewLeaderElector 가 에러를 내고 Run 이 그대로 반환한다.
 func (c Config) validate() error {
 	if c.Namespace == "" || c.LeaseName == "" || c.Identity == "" {
 		return ErrInvalidConfig
-	}
-	if c.LeaseDuration <= c.RenewDeadline {
-		return errors.New("leaderelection: LeaseDuration 은 RenewDeadline 보다 커야 한다")
-	}
-	if c.RenewDeadline <= time.Duration(leaderelection.JitterFactor*float64(c.RetryPeriod)) {
-		return errors.New("leaderelection: RenewDeadline 은 RetryPeriod*JitterFactor 보다 커야 한다")
 	}
 	return nil
 }
@@ -144,6 +140,10 @@ func Run(ctx context.Context, client kubernetes.Interface, cfg Config) error {
 		},
 	}
 
+	// client-go 는 Run 에서 OnStoppedLeading 을 defer 로 무조건 부른다. 리더가 된 적 없는
+	// 팔로워가 종료(acquire 실패)해도 불리므로, 실제로 리딩을 시작한 경우에만 전달한다.
+	var startedLeading atomic.Bool
+
 	elector, err := leaderelection.NewLeaderElector(leaderelection.LeaderElectionConfig{
 		Lock:            lock,
 		ReleaseOnCancel: true,
@@ -152,12 +152,13 @@ func Run(ctx context.Context, client kubernetes.Interface, cfg Config) error {
 		RetryPeriod:     cfg.RetryPeriod,
 		Callbacks: leaderelection.LeaderCallbacks{
 			OnStartedLeading: func(ctx context.Context) {
+				startedLeading.Store(true)
 				if cfg.OnStartedLeading != nil {
 					cfg.OnStartedLeading(ctx)
 				}
 			},
 			OnStoppedLeading: func() {
-				if cfg.OnStoppedLeading != nil {
+				if startedLeading.Load() && cfg.OnStoppedLeading != nil {
 					cfg.OnStoppedLeading()
 				}
 			},
@@ -188,8 +189,9 @@ func Run(ctx context.Context, client kubernetes.Interface, cfg Config) error {
 // RunUntilCancelled 는 ctx 가 취소될 때까지 리더 선출에 계속 참여한다.
 //
 // Run 을 반복 호출해, 리더직을 비자발적으로 잃으면(ErrLostLease) 같은 프로세스에서
-// 곧바로 후보로 재참여(재경쟁)한다. ctx 가 취소되면 nil 을 반환하고, 설정 오류 등
-// ErrLostLease 가 아닌 에러는 재시도하지 않고 그대로 반환한다.
+// 곧바로 후보로 재참여(재경쟁)한다. ctx 가 취소(Canceled)되면 nil 을 반환하고,
+// 데드라인 만료 등 그 외 ctx 종료 사유나 설정 오류처럼 ErrLostLease 가 아닌 에러는
+// 재시도하지 않고 그대로 반환한다.
 //
 // 주의: 리더가 잡고 있던 in-memory 상태가 남은 채 재경쟁하므로, 리더 전용 작업은
 // OnStartedLeading 의 ctx 취소를 존중해 확실히 정리한 뒤 다음 리더로 넘어가야 한다.

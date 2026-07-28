@@ -102,13 +102,6 @@ func runLeaderWork(ctx context.Context, identity string) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			// select 는 ready 케이스를 무작위로 고르므로, 작업 직전 ctx 취소를
-			// 우선 확인해 (rejoin 재획득 시) 이전 고루틴과 겹치는 창을 줄인다.
-			select {
-			case <-ctx.Done():
-				return
-			default:
-			}
 			log.Printf("[%s] 리더 작업 수행 중...", identity)
 		}
 	}

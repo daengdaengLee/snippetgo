@@ -3,6 +3,7 @@ package leaderelection
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -65,29 +66,27 @@ func TestValidate(t *testing.T) {
 		}
 	})
 
-	t.Run("LeaseDuration <= RenewDeadline 이면 에러", func(t *testing.T) {
-		c := base
-		c.RenewDeadline = c.LeaseDuration
-		if err := c.validate(); err == nil {
-			t.Error("LeaseDuration <= RenewDeadline 인데 에러가 없다")
-		}
-	})
+	// 타이밍 관계식은 validate 가 아니라 client-go NewLeaderElector 가 검사한다.
+	// (그 위임은 TestRunRejectsBadTiming 에서 확인)
+}
 
-	t.Run("RenewDeadline <= RetryPeriod*JitterFactor 면 에러", func(t *testing.T) {
-		// RetryPeriod < RenewDeadline 은 만족하지만 JitterFactor(1.2) 를 곱하면
-		// 1.2*9s=10.8s >= 10s 라 client-go 와 마찬가지로 거부되어야 한다.
-		c := Config{
-			Namespace:     "ns",
-			LeaseName:     "lease",
-			Identity:      "pod-a",
-			LeaseDuration: 15 * time.Second,
-			RenewDeadline: 10 * time.Second,
-			RetryPeriod:   9 * time.Second,
-		}
-		if err := c.validate(); err == nil {
-			t.Error("RenewDeadline <= RetryPeriod*JitterFactor 인데 에러가 없다")
-		}
-	})
+// 잘못된 타이밍은 validate 가 아니라 NewLeaderElector 에서 걸러져야 한다. Run 이 그 에러를
+// 그대로 반환하는지 확인한다. 잘못된 타이밍은 선출 루프 진입 전에 실패하므로 블록하지 않는다.
+func TestRunRejectsBadTiming(t *testing.T) {
+	cfg := Config{
+		Namespace:     "ns",
+		LeaseName:     "lease",
+		Identity:      "pod-a",
+		LeaseDuration: 1 * time.Second, // LeaseDuration <= RenewDeadline -> NewLeaderElector 에러
+		RenewDeadline: 2 * time.Second,
+	}
+	err := Run(context.Background(), fake.NewSimpleClientset(), cfg)
+	if err == nil {
+		t.Fatal("잘못된 타이밍인데 에러가 없다")
+	}
+	if errors.Is(err, ErrInvalidConfig) {
+		t.Errorf("err = %v, want NewLeaderElector 의 타이밍 에러(ErrInvalidConfig 아님)", err)
+	}
 }
 
 // 이미 취소된 ctx 로 부르면 Run/RunUntilCancelled 은 패닉 없이 nil 을 반환해야 한다
@@ -112,5 +111,31 @@ func TestRunUntilCancelledDoesNotRetryConfigError(t *testing.T) {
 	err := RunUntilCancelled(context.Background(), fake.NewSimpleClientset(), cfg)
 	if !errors.Is(err, ErrInvalidConfig) {
 		t.Errorf("RunUntilCancelled = %v, want ErrInvalidConfig", err)
+	}
+}
+
+// 리더가 된 적 없는 경우(취소된 ctx -> acquire 진입 전 종료) OnStoppedLeading 은 호출되면 안 된다.
+// client-go 는 defer 로 무조건 부르지만 래퍼가 startedLeading 가드로 막는다.
+func TestOnStoppedLeadingGuardedForFollower(t *testing.T) {
+	var started, stopped atomic.Int32
+	cfg := Config{
+		Namespace:        "ns",
+		LeaseName:        "lease",
+		Identity:         "pod-a",
+		OnStartedLeading: func(context.Context) { started.Add(1) },
+		OnStoppedLeading: func() { stopped.Add(1) },
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // acquire 진입 전 종료 -> 리더가 되지 못함
+
+	if err := Run(ctx, fake.NewSimpleClientset(), cfg); err != nil {
+		t.Fatalf("Run = %v, want nil", err)
+	}
+	if got := started.Load(); got != 0 {
+		t.Errorf("OnStartedLeading 호출 %d 회, want 0", got)
+	}
+	if got := stopped.Load(); got != 0 {
+		t.Errorf("OnStoppedLeading 호출 %d 회, want 0 (팔로워는 정리 콜백을 받으면 안 됨)", got)
 	}
 }

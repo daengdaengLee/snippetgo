@@ -1,0 +1,8 @@
+# base: 리더 선출 데모의 기본 배포(LE_MODE=exit).
+# 배포: kubectl apply -k manifests
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - namespace.yaml
+  - rbac.yaml
+  - deployment.yaml
