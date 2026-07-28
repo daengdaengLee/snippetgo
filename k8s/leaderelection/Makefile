@@ -43,9 +43,11 @@ load: ## 빌드한 이미지를 kind 노드에 적재
 	kind load docker-image $(IMAGE) --name $(CLUSTER)
 
 .PHONY: deploy
-deploy: ## 네임스페이스/RBAC/Deployment 적용(MODE 주입) 후 롤아웃 대기
-	kubectl apply -f manifests/
-	kubectl -n $(NAMESPACE) set env deploy/leaderelection LE_MODE=$(MODE)
+deploy: ## 네임스페이스/RBAC/Deployment(MODE 렌더) 적용 후 롤아웃 대기
+	kubectl apply -f manifests/namespace.yaml -f manifests/rbac.yaml
+	# deployment.yaml 을 단일 source of truth 로 두고 MODE 만 렌더해 한 번만 적용한다
+	# (value: exit 은 LE_MODE 에만 있는 유일 문자열. MODE=exit 이면 no-op 치환).
+	sed 's/value: exit/value: $(MODE)/' manifests/deployment.yaml | kubectl apply -f -
 	kubectl -n $(NAMESPACE) rollout status deploy/leaderelection --timeout=90s
 
 .PHONY: status

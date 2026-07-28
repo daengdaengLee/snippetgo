@@ -118,7 +118,8 @@ func (c Config) validate() error {
 //
 //   - ctx 가 취소됨(예: SIGTERM): 이 인스턴스가 리더였다면 Lease 를 즉시 반납하고
 //     (ReleaseOnCancel) nil 을 반환한다. 다음 리더는 LeaseDuration 만료를 기다리지 않고
-//     바로 이어받아 failover 가 빨라진다.
+//     바로 이어받아 failover 가 빨라진다. ctx 가 데드라인 만료 등 취소가 아닌 사유로
+//     끝났다면 해당 ctx 에러를 그대로 반환한다.
 //   - 리더직 비자발적 상실(갱신 실패): ctx 는 살아 있는데 client-go 의 선출 루프가
 //     리더 임대를 놓쳐 반환한 경우로, ErrLostLease 를 반환한다.
 //
@@ -175,8 +176,11 @@ func Run(ctx context.Context, client kubernetes.Interface, cfg Config) error {
 	// (client-go docstring: "stopped by ctx or it has stopped holding the leader lease").
 	// 자체적으로 에러를 돌려주지 않으므로 종료 원인은 ctx 상태로 구분한다.
 	elector.Run(ctx)
-	if ctx.Err() != nil {
-		return nil // ctx 로 멈춤 = 정상 종료(취소/데드라인)
+	if err := ctx.Err(); err != nil {
+		if errors.Is(err, context.Canceled) {
+			return nil // SIGTERM 등 정상 취소
+		}
+		return err // 데드라인 만료 등은 그대로 알린다
 	}
 	return ErrLostLease // ctx 는 살아 있는데 반환됨 = 비자발적 리더직 상실
 }

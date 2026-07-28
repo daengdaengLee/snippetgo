@@ -208,7 +208,10 @@ API 의 `metadata.name`(Pod 이름) 을 `POD_NAME` 으로 주입해 쓴다. `cmd
 
 리더 전용 작업은 콜백으로 넘어온 `ctx` 가 취소되면(리더직 상실/종료) **반드시 멈춰야 한다**.
 멈추지 않으면 리더가 바뀐 뒤에도 옛 리더가 작업을 계속해 함정 1 을 악화시킨다. `cmd/main.go` 의
-`runLeaderWork` 는 `ticker` 루프에서 `ctx.Done()` 을 항상 확인한다.
+`runLeaderWork` 는 `ticker` 루프에서 `ctx.Done()` 을 항상 확인하고, 작업 직전에도 한 번 더
+우선 확인한다. 다만 client-go 가 `OnStartedLeading` 을 detached 고루틴으로 띄우므로, rejoin
+모드에서 같은 Pod 가 상실 직후 재획득하면 이전 작업 고루틴이 완전히 끝나기 전 새 고루틴과 아주
+짧게 겹칠 수 있다. 실전 싱글톤 작업이라면 이 창까지 감안해 멱등성/펜싱을 두는 게 안전하다.
 
 ### 6. 리더직 상실 처리: exit vs rejoin - 구현됨
 
@@ -219,6 +222,8 @@ client-go `LeaderElector.Run(ctx)` 은 "ctx 취소 **또는** 리더직 상실" 
 - **exit** (`Run`, 기본): 상실 시 `ErrLostLease` 반환 -> `cmd` 가 프로세스를 비정상 종료 ->
   Kubernetes 가 Pod 를 재시작해 **깨끗한 상태로** 다시 경쟁에 합류. kube-controller-manager,
   controller-runtime 이 쓰는 표준 방식. 리더가 in-memory 상태를 쌓아둔다면 이쪽이 안전하다.
+  단, 갱신 실패가 짧은 간격으로 반복되면 kubelet 의 CrashLoopBackOff 지수 백오프(최대 약 5분)에
+  걸려 그 Pod 의 재합류가 지연될 수 있다.
 - **rejoin** (`RunUntilCancelled`): 상실해도 **같은 프로세스가 후보로 재참여**한다. 재시작
   비용이 없지만, 이전 리더의 in-memory 상태가 남은 채 재경쟁하므로 함정 5(ctx 존중) 를 특히
   철저히 지켜 리더 전환 시 상태를 확실히 리셋해야 한다.
