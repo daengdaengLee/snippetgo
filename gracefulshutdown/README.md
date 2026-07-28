@@ -195,6 +195,8 @@ in-flight: curl exit=52 HTTP 000 (1.495901s)     # 52 = Empty reply from server
 
 이번엔 `request canceled` 다. 유예가 끝나면서 hard stop 이 핸들러까지 전달됐고,
 에러는 `ErrShutdownTimeout` 과 `context.DeadlineExceeded` 를 모두 감싸고 있다.
+`/slow` 는 이 경로에서 응답 본문을 쓰지 않고 반환하므로 curl 은 `exit=52`(empty reply)
+를 본다. 타임아웃을 초과하면 응답이 끊기는 것이 정상이다.
 
 ### 3. 두 번째 Ctrl+C 로 긴 drain 탈출
 

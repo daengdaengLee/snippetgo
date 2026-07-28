@@ -104,6 +104,8 @@ func newMux(ready *atomic.Bool) *http.ServeMux {
 			log.Println("/slow: timer fired -> responding normally")
 			_, _ = w.Write([]byte("slow done\n"))
 		case <-r.Context().Done():
+			// 응답 본문을 쓰지 않고 반환한다. hard stop 으로 커넥션이 끊기므로
+			// 클라이언트는 empty reply(끊긴 응답)를 받는다. 데모가 의도한 동작이다.
 			log.Printf("/slow: request canceled -> %v", r.Context().Err())
 		}
 	})

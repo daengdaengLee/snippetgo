@@ -150,7 +150,7 @@ func Serve(ctx context.Context, srv *http.Server, ln net.Listener, cfg Config) e
 	//     BaseContext 를 읽는 쪽과 쓰는 쪽이 겹쳐 data race 가 된다.
 	defer func() {
 		stopHard()
-		_ = srv.Close()
+		_ = srv.Close() // 타임아웃 경로에선 남은 커넥션을 실제로 끊는 강제 종료 수단이다. 정상 경로에선 no-op.
 		<-serveDone // 훅 panic 등으로 본문 말미에 도달하지 못한 경로용
 		srv.BaseContext = base
 	}()
