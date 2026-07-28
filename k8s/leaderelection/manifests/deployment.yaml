@@ -1,0 +1,55 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: leaderelection
+  namespace: snippetgo-leaderelection
+  labels:
+    app: leaderelection
+spec:
+  # replica 3 개가 하나의 Lease 를 두고 경쟁한다. 그중 하나만 리더가 된다.
+  replicas: 3
+  selector:
+    matchLabels:
+      app: leaderelection
+  template:
+    metadata:
+      labels:
+        app: leaderelection
+    spec:
+      serviceAccountName: leaderelection
+      # 리더 상실 시 빠르게 반납/재선출되도록 종료 유예를 짧게 준다.
+      terminationGracePeriodSeconds: 10
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: leaderelection
+          image: snippetgo/leaderelection:dev
+          # kind load 로 노드에 이미지를 직접 심으므로 레지스트리에서 당기지 않는다.
+          imagePullPolicy: IfNotPresent
+          env:
+            # identity 로 쓸 Pod 이름을 Downward API 로 주입한다(그룹 내 유일).
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: LEASE_NAME
+              value: snippetgo-leaderelection
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
