@@ -41,6 +41,9 @@ spec:
                   fieldPath: metadata.namespace
             - name: LEASE_NAME
               value: snippetgo-leaderelection
+            # 리더직 상실 처리 방식. Makefile 의 deploy 가 MODE 로 덮어쓴다(exit | rejoin).
+            - name: LE_MODE
+              value: exit
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true

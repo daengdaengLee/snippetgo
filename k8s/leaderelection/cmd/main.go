@@ -1,8 +1,12 @@
-// Command main 은 leaderelection.Run 을 손으로 확인해 보기 위한 데모다.
+// Command main 은 leaderelection 패키지를 손으로 확인해 보기 위한 데모다.
 //
 // 인클러스터(파드 안)면 ServiceAccount 를 자동으로 쓰고, 클러스터 밖이면
 // -kubeconfig/KUBECONFIG/~/.kube/config 로 폴백한다. 같은 이미지를 replica 여러 개로
 // 띄우면 그중 하나만 "started leading" 로그를 남긴다.
+//
+// -mode 로 리더직 상실 처리 방식을 고른다.
+//   - exit(기본):  상실 시 프로세스를 비정상 종료 -> Kubernetes 가 Pod 재시작
+//   - rejoin:      상실해도 같은 프로세스가 후보로 재참여
 //
 // 사용법은 k8s/leaderelection/README.md 의 "직접 확인해보기" 를 참고.
 package main
@@ -10,6 +14,7 @@ package main
 import (
 	"cmp"
 	"context"
+	"errors"
 	"flag"
 	"log"
 	"os"
@@ -26,6 +31,7 @@ import (
 
 func main() {
 	kubeconfig := flag.String("kubeconfig", "", "클러스터 밖에서 실행할 때 쓸 kubeconfig 경로 (비우면 KUBECONFIG/~/.kube/config)")
+	mode := flag.String("mode", cmp.Or(os.Getenv("LE_MODE"), "exit"), "리더직 상실 처리: exit | rejoin")
 	flag.Parse()
 
 	// identity 는 그룹 안에서 유일해야 한다. 파드 안이면 Downward API 로 주입한
@@ -44,7 +50,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	log.Printf("리더 선출 시작: identity=%s namespace=%s lease=%s", identity, namespace, leaseName)
+	log.Printf("리더 선출 시작: identity=%s namespace=%s lease=%s mode=%s", identity, namespace, leaseName, *mode)
 
 	cfg := leaderelection.Config{
 		Namespace: namespace,
@@ -65,8 +71,24 @@ func main() {
 		},
 	}
 
-	if err := leaderelection.Run(ctx, client, cfg); err != nil {
-		log.Fatalf("리더 선출 종료(에러): %v", err)
+	switch *mode {
+	case "exit":
+		// 리더직 상실을 프로세스 종료로 승격한다. Kubernetes 가 Pod 를 재시작해
+		// 깨끗한 상태로 다시 경쟁에 합류시킨다(controller-runtime 표준 동작).
+		err := leaderelection.Run(ctx, client, cfg)
+		if errors.Is(err, leaderelection.ErrLostLease) {
+			log.Fatalf("[%s] 리더직 상실 - 재시작에 위임한다: %v", identity, err)
+		}
+		if err != nil {
+			log.Fatalf("[%s] 리더 선출 종료(에러): %v", identity, err)
+		}
+	case "rejoin":
+		// 리더직을 잃어도 같은 프로세스가 후보로 재참여한다.
+		if err := leaderelection.RunUntilCancelled(ctx, client, cfg); err != nil {
+			log.Fatalf("[%s] 리더 선출 종료(에러): %v", identity, err)
+		}
+	default:
+		log.Fatalf("알 수 없는 -mode=%q (exit | rejoin)", *mode)
 	}
 	log.Printf("[%s] 종료", identity)
 }

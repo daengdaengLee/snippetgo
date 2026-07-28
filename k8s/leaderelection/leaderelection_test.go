@@ -1,9 +1,12 @@
 package leaderelection
 
 import (
+	"context"
 	"errors"
 	"testing"
 	"time"
+
+	"k8s.io/client-go/kubernetes/fake"
 )
 
 func TestApplyDefaults(t *testing.T) {
@@ -62,11 +65,52 @@ func TestValidate(t *testing.T) {
 		}
 	})
 
-	t.Run("타이밍 관계식이 깨지면 에러", func(t *testing.T) {
+	t.Run("LeaseDuration <= RenewDeadline 이면 에러", func(t *testing.T) {
 		c := base
-		c.RenewDeadline = c.LeaseDuration // RenewDeadline >= LeaseDuration
+		c.RenewDeadline = c.LeaseDuration
 		if err := c.validate(); err == nil {
-			t.Error("RenewDeadline >= LeaseDuration 인데 에러가 없다")
+			t.Error("LeaseDuration <= RenewDeadline 인데 에러가 없다")
 		}
 	})
+
+	t.Run("RenewDeadline <= RetryPeriod*JitterFactor 면 에러", func(t *testing.T) {
+		// RetryPeriod < RenewDeadline 은 만족하지만 JitterFactor(1.2) 를 곱하면
+		// 1.2*9s=10.8s >= 10s 라 client-go 와 마찬가지로 거부되어야 한다.
+		c := Config{
+			Namespace:     "ns",
+			LeaseName:     "lease",
+			Identity:      "pod-a",
+			LeaseDuration: 15 * time.Second,
+			RenewDeadline: 10 * time.Second,
+			RetryPeriod:   9 * time.Second,
+		}
+		if err := c.validate(); err == nil {
+			t.Error("RenewDeadline <= RetryPeriod*JitterFactor 인데 에러가 없다")
+		}
+	})
+}
+
+// 이미 취소된 ctx 로 부르면 Run/RunUntilCancelled 은 패닉 없이 nil 을 반환해야 한다
+// (ctx 로 멈춘 정상 종료 경로). fake clientset 으로 client-go 실제 경로를 태운다.
+func TestRunReturnsOnCancelledContext(t *testing.T) {
+	cfg := Config{Namespace: "ns", LeaseName: "lease", Identity: "pod-a"}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // 시작 전에 취소
+
+	if err := Run(ctx, fake.NewSimpleClientset(), cfg); err != nil {
+		t.Errorf("Run = %v, want nil", err)
+	}
+	if err := RunUntilCancelled(ctx, fake.NewSimpleClientset(), cfg); err != nil {
+		t.Errorf("RunUntilCancelled = %v, want nil", err)
+	}
+}
+
+// 설정 오류는 ErrLostLease 가 아니므로 RunUntilCancelled 이 재시도하지 않고 그대로 반환해야 한다.
+func TestRunUntilCancelledDoesNotRetryConfigError(t *testing.T) {
+	cfg := Config{LeaseName: "lease", Identity: "pod-a"} // Namespace 누락
+	err := RunUntilCancelled(context.Background(), fake.NewSimpleClientset(), cfg)
+	if !errors.Is(err, ErrInvalidConfig) {
+		t.Errorf("RunUntilCancelled = %v, want ErrInvalidConfig", err)
+	}
 }

@@ -15,7 +15,9 @@ metadata:
 rules:
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]
-    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+    # 리더 선출은 Lease 를 삭제하지 않는다. 반납(ReleaseOnCancel) 도 홀더를 비우는
+    # update 라서 delete 권한은 필요 없다(최소 권한 유지).
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

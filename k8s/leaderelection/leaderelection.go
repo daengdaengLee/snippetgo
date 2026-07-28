@@ -43,6 +43,12 @@ const (
 // 필수 값이 비어 있을 때 Run 이 반환한다.
 var ErrInvalidConfig = errors.New("leaderelection: Namespace, LeaseName, Identity 는 필수다")
 
+// ErrLostLease 는 이 인스턴스가 리더였다가 갱신(renew) 에 실패해 리더직을 비자발적으로
+// 상실했을 때 Run 이 반환한다. ctx 취소로 인한 정상 종료(nil 반환) 와 구분하기 위한 신호다.
+// controller-runtime 처럼 이 에러를 받으면 프로세스를 종료해 재시작에 맡기거나(exit),
+// RunUntilCancelled 로 감싸 같은 프로세스에서 재경쟁하게(rejoin) 할 수 있다.
+var ErrLostLease = errors.New("leaderelection: 리더직을 상실했다 (갱신 실패)")
+
 // Config 는 리더 선출 한 판에 필요한 설정이다.
 //
 // Namespace/LeaseName/Identity 는 필수이고, 나머지 타이밍 값은 0 이면
@@ -91,23 +97,33 @@ func (c Config) applyDefaults() Config {
 }
 
 // validate 는 기본값으로 못 채우는 필수 값과 타이밍 관계식을 확인한다.
+//
+// 타이밍 검사는 client-go 의 NewLeaderElector 가 강제하는 것과 정확히 같은 식을 쓴다.
+// 특히 RenewDeadline 은 단순히 RetryPeriod 보다 큰 정도가 아니라 JitterFactor(=1.2) 를
+// 곱한 값보다 커야 한다. 미리 걸러 클라이언트 생성 전에 명확한 에러를 준다.
 func (c Config) validate() error {
 	if c.Namespace == "" || c.LeaseName == "" || c.Identity == "" {
 		return ErrInvalidConfig
 	}
-	// client-go 도 내부에서 같은 관계식을 강제한다. 미리 걸러 명확한 에러를 준다.
-	if c.RenewDeadline >= c.LeaseDuration || c.RetryPeriod >= c.RenewDeadline {
-		return errors.New("leaderelection: RetryPeriod < RenewDeadline < LeaseDuration 이어야 한다")
+	if c.LeaseDuration <= c.RenewDeadline {
+		return errors.New("leaderelection: LeaseDuration 은 RenewDeadline 보다 커야 한다")
+	}
+	if c.RenewDeadline <= time.Duration(leaderelection.JitterFactor*float64(c.RetryPeriod)) {
+		return errors.New("leaderelection: RenewDeadline 은 RetryPeriod*JitterFactor 보다 커야 한다")
 	}
 	return nil
 }
 
-// Run 은 리더 선출에 참여하고, ctx 가 취소될 때까지 블록한다.
+// Run 은 리더 선출 한 세션에 참여하고, 아래 둘 중 먼저 오는 시점에 반환한다.
 //
-// ctx 가 취소되면(예: SIGTERM) 이 인스턴스가 리더였다면 Lease 를 즉시 반납한다
-// (ReleaseOnCancel). 덕분에 다음 리더는 LeaseDuration 만료를 기다리지 않고 바로
-// 이어받아 failover 가 빨라진다. 정상 종료로 ctx 가 취소돼 멈춘 경우 nil 을,
-// 설정이 잘못된 경우 ErrInvalidConfig 등을 반환한다.
+//   - ctx 가 취소됨(예: SIGTERM): 이 인스턴스가 리더였다면 Lease 를 즉시 반납하고
+//     (ReleaseOnCancel) nil 을 반환한다. 다음 리더는 LeaseDuration 만료를 기다리지 않고
+//     바로 이어받아 failover 가 빨라진다.
+//   - 리더직 비자발적 상실(갱신 실패): ctx 는 살아 있는데 client-go 의 선출 루프가
+//     리더 임대를 놓쳐 반환한 경우로, ErrLostLease 를 반환한다.
+//
+// 설정이 잘못된 경우 ErrInvalidConfig 등을 반환한다. 리더직을 잃어도 같은 프로세스에서
+// 계속 재경쟁하려면 RunUntilCancelled 를 쓴다.
 func Run(ctx context.Context, client kubernetes.Interface, cfg Config) error {
 	cfg = cfg.applyDefaults()
 	if err := cfg.validate(); err != nil {
@@ -155,11 +171,36 @@ func Run(ctx context.Context, client kubernetes.Interface, cfg Config) error {
 		return err
 	}
 
-	// Run 은 ctx 가 취소될 때까지 블록한다. 자체적으로 에러를 반환하지 않으므로
-	// 종료 원인은 ctx.Err 로 판단한다. 정상 취소는 에러가 아니다.
+	// elector.Run 은 ctx 취소 "또는" 리더직 상실 중 먼저 오는 시점에 반환한다
+	// (client-go docstring: "stopped by ctx or it has stopped holding the leader lease").
+	// 자체적으로 에러를 돌려주지 않으므로 종료 원인은 ctx 상태로 구분한다.
 	elector.Run(ctx)
-	if err := ctx.Err(); err != nil && !errors.Is(err, context.Canceled) {
-		return err
+	if ctx.Err() != nil {
+		return nil // ctx 로 멈춤 = 정상 종료(취소/데드라인)
 	}
-	return nil
+	return ErrLostLease // ctx 는 살아 있는데 반환됨 = 비자발적 리더직 상실
+}
+
+// RunUntilCancelled 는 ctx 가 취소될 때까지 리더 선출에 계속 참여한다.
+//
+// Run 을 반복 호출해, 리더직을 비자발적으로 잃으면(ErrLostLease) 같은 프로세스에서
+// 곧바로 후보로 재참여(재경쟁)한다. ctx 가 취소되면 nil 을 반환하고, 설정 오류 등
+// ErrLostLease 가 아닌 에러는 재시도하지 않고 그대로 반환한다.
+//
+// 주의: 리더가 잡고 있던 in-memory 상태가 남은 채 재경쟁하므로, 리더 전용 작업은
+// OnStartedLeading 의 ctx 취소를 존중해 확실히 정리한 뒤 다음 리더로 넘어가야 한다.
+func RunUntilCancelled(ctx context.Context, client kubernetes.Interface, cfg Config) error {
+	for {
+		err := Run(ctx, client, cfg)
+		if err == nil {
+			return nil // ctx 취소로 정상 종료
+		}
+		if !errors.Is(err, ErrLostLease) {
+			return err // 설정 오류 등은 재시도하지 않는다
+		}
+		if ctx.Err() != nil {
+			return nil // 상실과 취소가 겹친 경우도 정상 종료로 본다
+		}
+		// 리더직만 잃고 ctx 는 살아 있음 -> 루프가 다시 Run 을 돌려 재경쟁(acquire)한다.
+	}
 }

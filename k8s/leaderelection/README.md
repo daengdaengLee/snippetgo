@@ -56,9 +56,15 @@ err := leaderelection.Run(ctx, client, leaderelection.Config{
 
 ```go
 func Run(ctx context.Context, client kubernetes.Interface, cfg Config) error
+func RunUntilCancelled(ctx context.Context, client kubernetes.Interface, cfg Config) error
 ```
 
-`ctx` 가 취소될 때까지 블록한다. 정상 취소(SIGTERM 등)면 `nil` 을 반환한다.
+`Run` 은 리더 선출 **한 세션**에 참여해, `ctx` 취소 **또는** 리더직 비자발적 상실(갱신 실패)
+중 먼저 오는 시점에 반환한다. 정상 취소(SIGTERM 등)면 `nil`, 리더직을 잃으면 `ErrLostLease` 다.
+
+`RunUntilCancelled` 는 `Run` 을 반복 호출해, 리더직을 잃어도 **같은 프로세스에서 재경쟁**하며
+`ctx` 취소까지 블록한다. 리더직 상실을 프로세스 종료로 다루려면(재시작 위임) `Run` 을, 인프로세스
+재선출을 원하면 `RunUntilCancelled` 를 쓴다 (함정 6 참고).
 
 `Config` 필드:
 
@@ -79,13 +85,16 @@ func Run(ctx context.Context, client kubernetes.Interface, cfg Config) error
 | 반환 | 언제 |
 | --- | --- |
 | `nil` | `ctx` 가 정상 취소되어 종료 |
+| `ErrLostLease` | (`Run` 한정) 리더였다가 갱신 실패로 리더직을 비자발적으로 상실 |
 | `ErrInvalidConfig` | `Namespace`/`LeaseName`/`Identity` 중 하나라도 비었을 때 |
 | 그 외 에러 | 타이밍 관계식 위반, 클라이언트 생성 실패 등 |
 
 ## 동작 방식
 
-리더 선출의 핵심은 세 타이밍 값의 관계다. 항상
-`RetryPeriod < RenewDeadline < LeaseDuration` 이어야 하며, 어기면 `Run` 이 에러를 낸다.
+리더 선출의 핵심은 세 타이밍 값의 관계다. `RenewDeadline < LeaseDuration` 이어야 하고,
+`RenewDeadline` 은 단순히 `RetryPeriod` 보다 큰 게 아니라 **`RetryPeriod * JitterFactor(1.2)`
+보다** 커야 한다. `validate` 가 client-go `NewLeaderElector` 와 똑같은 식을 미리 검사해,
+어기면 클라이언트 생성 전에 명확한 에러를 낸다(함정 2 참고).
 
 | 값 | 의미 | 크면 | 작으면 |
 | --- | --- | --- | --- |
@@ -102,12 +111,16 @@ func Run(ctx context.Context, client kubernetes.Interface, cfg Config) error
 
 | 명령 | 하는 일 |
 | --- | --- |
-| `make demo` | 기존 클러스터 정리 -> kind 생성 -> 이미지 빌드/적재 -> 배포 |
+| `make demo` | 기존 클러스터 정리 -> kind 생성 -> 이미지 빌드/적재 -> 배포 (`exit` 모드) |
+| `make demo-rejoin` | 위와 같되 `rejoin` 모드로 배포 (`make demo MODE=rejoin` 과 동일) |
 | `make logs` | 모든 Pod 로그 실시간(리더 관찰) |
 | `make status` | Lease 1 개와 Pod 3 개 상태 |
 | `make leader` | 현재 리더(`Lease.holderIdentity`) 출력 |
 | `make kill-leader` | 현재 리더 Pod 삭제 -> failover 유도 |
 | `make clean` | 클러스터/바이너리 정리 |
+
+`MODE` 는 리더직 상실 처리 방식을 고른다(`exit` 기본 | `rejoin`). `deploy` 가 `kubectl set env`
+로 Deployment 의 `LE_MODE` 에 주입한다.
 
 배포 후 Lease 를 보면 한 Pod 가 홀더로 잡혀 있다:
 
@@ -142,7 +155,10 @@ pod "leaderelection-6c9d4f8b7-abcde" deleted
 ```
 
 `ReleaseOnCancel` 덕에 정상 종료(`delete pod` 는 SIGTERM 을 보냄) 라 Lease 가 즉시 반납되어
-`LeaseDuration` 을 기다리지 않고 바로 넘어간다.
+`LeaseDuration` 을 기다리지 않고 바로 넘어간다. 이 `kill-leader` failover 는 SIGTERM -> ctx 취소
+-> 깨끗한 종료 경로라 **exit/rejoin 두 모드에서 동일**하게 동작한다. 두 모드의 차이는 *비자발적*
+리더직 상실(리더가 API 서버와 단절돼 갱신에 실패하는 경우) 에서만 드러나는데, 이건 API 파티션을
+인위로 만들어야 해서 이 데모 스크립트로는 재현하지 않는다(함정 6 에서 설명).
 
 ## 매니페스트 / RBAC
 
@@ -150,9 +166,10 @@ pod "leaderelection-6c9d4f8b7-abcde" deleted
 
 - `namespace.yaml` - 전용 네임스페이스 `snippetgo-leaderelection`.
 - `rbac.yaml` - ServiceAccount + Role + RoleBinding. Role 은 **`coordination.k8s.io` 의
-  `leases` 에 대한 권한만** 준다(`get,list,watch,create,update,patch,delete`). 리더 선출은
-  Lease 를 만들고 자기 것으로 갱신하며 남의 상태를 볼 뿐이라, 그 외 권한은 필요 없다.
-  이 스니펫은 `EventRecorder` 를 쓰지 않으므로 `events` 권한도 필요 없다.
+  `leases` 에 대한 권한만** 준다(`get,list,watch,create,update,patch`). 리더 선출은
+  Lease 를 만들고 자기 것으로 갱신하며 남의 상태를 볼 뿐이라, 그 외 권한은 필요 없다. 반납
+  (`ReleaseOnCancel`) 도 홀더를 비우는 `update` 라서 `delete` 조차 필요 없다. 이 스니펫은
+  `EventRecorder` 를 쓰지 않으므로 `events` 권한도 필요 없다.
 - `deployment.yaml` - `replicas: 3`. Downward API 로 `POD_NAME`/`POD_NAMESPACE` 를 주입해
   identity 로 쓴다. 이미지는 `imagePullPolicy: IfNotPresent`(kind 로 노드에 직접 적재),
   distroless nonroot 와 맞춘 `securityContext`(비루트, 읽기 전용 루트 FS).
@@ -168,10 +185,12 @@ pod "leaderelection-6c9d4f8b7-abcde" deleted
 둘일 수 있다**. 진짜로 "절대 동시에 둘이면 안 되는" 자원은 리더 신분과 별개로 fencing 을 걸어야
 한다(예: 쓰기 시 리소스 버전/펜싱 토큰 검증). 리더 선출은 "대부분의 시간에 하나" 를 보장할 뿐이다.
 
-### 2. `RetryPeriod < RenewDeadline < LeaseDuration` - 구현됨
+### 2. 타이밍 검증은 JitterFactor 까지 미러링한다 - 구현됨
 
-이 관계식이 깨지면 `Run` 이 즉시 에러를 낸다(`validate`). client-go 도 내부에서 같은 조건을
-강제하므로, 미리 걸러 명확한 메시지를 준다.
+`validate` 는 `LeaseDuration > RenewDeadline` 뿐 아니라
+`RenewDeadline > RetryPeriod * JitterFactor(1.2)` 까지, client-go `NewLeaderElector` 가 강제하는
+것과 **정확히 같은 식**을 검사한다. 예를 들어 `RetryPeriod=9s, RenewDeadline=10s` 는 단순
+대소로는 통과하지만 `1.2*9=10.8s >= 10s` 라 거부된다. 클라이언트 생성 전에 명확한 에러를 준다.
 
 ### 3. `ReleaseOnCancel` 로 빠른 failover - 구현됨
 
@@ -190,6 +209,21 @@ API 의 `metadata.name`(Pod 이름) 을 `POD_NAME` 으로 주입해 쓴다. `cmd
 리더 전용 작업은 콜백으로 넘어온 `ctx` 가 취소되면(리더직 상실/종료) **반드시 멈춰야 한다**.
 멈추지 않으면 리더가 바뀐 뒤에도 옛 리더가 작업을 계속해 함정 1 을 악화시킨다. `cmd/main.go` 의
 `runLeaderWork` 는 `ticker` 루프에서 `ctx.Done()` 을 항상 확인한다.
+
+### 6. 리더직 상실 처리: exit vs rejoin - 구현됨
+
+client-go `LeaderElector.Run(ctx)` 은 "ctx 취소 **또는** 리더직 상실" 중 먼저 오는 시점에
+반환한다. 리더가 갱신에 실패해 임대를 놓치면 ctx 가 살아 있어도 반환한다. 이 스니펫은 두 처리
+방식을 모두 제공한다.
+
+- **exit** (`Run`, 기본): 상실 시 `ErrLostLease` 반환 -> `cmd` 가 프로세스를 비정상 종료 ->
+  Kubernetes 가 Pod 를 재시작해 **깨끗한 상태로** 다시 경쟁에 합류. kube-controller-manager,
+  controller-runtime 이 쓰는 표준 방식. 리더가 in-memory 상태를 쌓아둔다면 이쪽이 안전하다.
+- **rejoin** (`RunUntilCancelled`): 상실해도 **같은 프로세스가 후보로 재참여**한다. 재시작
+  비용이 없지만, 이전 리더의 in-memory 상태가 남은 채 재경쟁하므로 함정 5(ctx 존중) 를 특히
+  철저히 지켜 리더 전환 시 상태를 확실히 리셋해야 한다.
+
+`-mode`(또는 `LE_MODE`) 로 고르고, `make demo` / `make demo-rejoin` 으로 각각 배포해 볼 수 있다.
 
 ## 참고 자료
 
