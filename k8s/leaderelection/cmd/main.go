@@ -61,7 +61,9 @@ func main() {
 			runLeaderWork(ctx, identity)
 		},
 		OnStoppedLeading: func() {
-			log.Printf("[%s] stopped leading - 리더 작업을 정리한다", identity)
+			// client-go 는 리더가 된 적 없는 팔로워에게도 이 콜백을 준다(README 함정 7).
+			// 그래서 "리더였다" 를 단정하지 않는다. 실제 정리는 멱등이어야 한다.
+			log.Printf("[%s] OnStoppedLeading 호출됨 (리더였다면 여기서 정리)", identity)
 		},
 		OnNewLeader: func(leader string) {
 			if leader == identity {

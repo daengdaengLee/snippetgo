@@ -28,7 +28,9 @@ build: ## 정적 리눅스 바이너리를 bin/leaderelection 로 빌드
 
 .PHONY: docker-build
 docker-build: build ## 바이너리를 복사한 컨테이너 이미지 빌드
-	docker build -t $(IMAGE) .
+	# 빌드한 바이너리(GOARCH)와 이미지 플랫폼을 맞춘다. DOCKER_DEFAULT_PLATFORM 이
+	# 다르게 잡혀 있어도 exec format error 를 피한다.
+	docker build --platform=linux/$(GOARCH) -t $(IMAGE) .
 
 .PHONY: kind-up
 kind-up: ## kind 클러스터 생성
