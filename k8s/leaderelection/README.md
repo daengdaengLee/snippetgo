@@ -119,9 +119,10 @@ func RunUntilCancelled(ctx context.Context, client kubernetes.Interface, cfg Con
 | `make kill-leader` | 현재 리더 Pod 삭제 -> failover 유도 |
 | `make clean` | 클러스터/바이너리 정리 |
 
-리더직 상실 처리 방식(`LE_MODE`)은 kustomize 로 고른다. base(`manifests`)는 `exit`,
+리더직 상실 처리 방식(`LE_MODE`)은 kustomize 로 고른다. base(`manifests/base`)는 `exit`,
 `manifests/overlays/rejoin` overlay 가 `rejoin` 으로 덮어쓴다. `make deploy` 는
-`kubectl apply -k $(KUSTOMIZE_DIR)` 로 배포하고, `make demo-rejoin` 은 overlay 를 가리킨다.
+`kubectl apply -k $(KUSTOMIZE_DIR)`(기본 `manifests/base`) 로 배포하고, `make demo-rejoin` 은
+overlay 를 가리킨다.
 
 배포 후 Lease 를 보면 한 Pod 가 홀더로 잡혀 있다:
 
@@ -163,19 +164,19 @@ pod "leaderelection-6c9d4f8b7-abcde" deleted
 
 ## 매니페스트 / RBAC
 
-`manifests/` 는 base(namespace/rbac/deployment)와 kustomization, 그리고 `overlays/rejoin`
-overlay 로 구성된다.
+`manifests/` 는 표준 base/overlays 구조다. `manifests/base/` 가 base(namespace/rbac/deployment
++ kustomization), `manifests/overlays/rejoin/` 이 overlay 다.
 
-- `namespace.yaml` - 전용 네임스페이스 `snippetgo-leaderelection`.
-- `rbac.yaml` - ServiceAccount + Role + RoleBinding. Role 은 **`coordination.k8s.io` 의
+- `base/namespace.yaml` - 전용 네임스페이스 `snippetgo-leaderelection`.
+- `base/rbac.yaml` - ServiceAccount + Role + RoleBinding. Role 은 **`coordination.k8s.io` 의
   `leases` 에 대해 `get,create,update` 만** 준다. `resourcelock.LeaseLock` 은 단일 Lease 를
   get(확인)/create(최초)/update(갱신,반납)할 뿐 list/watch/patch/delete 를 쓰지 않는다.
   `EventRecorder` 도 안 써서 `events` 권한 역시 필요 없다.
-- `deployment.yaml` - `replicas: 3`. Downward API 로 `POD_NAME`/`POD_NAMESPACE` 를 주입해
+- `base/deployment.yaml` - `replicas: 3`. Downward API 로 `POD_NAME`/`POD_NAMESPACE` 를 주입해
   identity 로 쓴다. 이미지는 `imagePullPolicy: IfNotPresent`(kind 로 노드에 직접 적재),
   distroless nonroot 와 맞춘 `securityContext`(비루트, 읽기 전용 루트 FS).
-- `kustomization.yaml` + `overlays/rejoin/` - `LE_MODE` 만 `rejoin` 으로 바꾸는 overlay.
-  `kubectl apply -k manifests`(exit) / `kubectl apply -k manifests/overlays/rejoin`(rejoin).
+- `overlays/rejoin/` - `LE_MODE` 만 `rejoin` 으로 바꾸는 overlay(base 를 참조).
+  `kubectl apply -k manifests/base`(exit) / `kubectl apply -k manifests/overlays/rejoin`(rejoin).
 
 이미지는 로컬에서 `go build` 한 정적 바이너리를 `Dockerfile` 이 복사만 한다(빌드는 Makefile,
 런타임은 `gcr.io/distroless/static:nonroot`).

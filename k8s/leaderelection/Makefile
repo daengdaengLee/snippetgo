@@ -10,7 +10,7 @@ CLUSTER   ?= snippetgo-le
 NAMESPACE  ?= snippetgo-leaderelection
 LEASE_NAME ?= snippetgo-leaderelection
 # 배포할 kustomize 디렉터리. base 는 exit, overlays/rejoin 은 rejoin 모드.
-KUSTOMIZE_DIR ?= manifests
+KUSTOMIZE_DIR ?= manifests/base
 # 바이너리는 kind 노드(리눅스) 에서 돌므로 GOOS 는 linux 로 고정하고
 # GOARCH 는 호스트에 맞춰 kind 노드 아키텍처와 일치시킨다.
 GOARCH    ?= $(shell go env GOARCH)
