@@ -77,7 +77,7 @@ func RunUntilCancelled(ctx context.Context, client kubernetes.Interface, cfg Con
 | `RenewDeadline` | X | `10s` | 리더가 이 시간 안에 갱신 실패 시 스스로 리더직을 내려놓음 |
 | `RetryPeriod` | X | `2s` | 획득/갱신 재시도 간격 |
 | `OnStartedLeading` | X | nil | 리더가 됐을 때 호출. 넘어온 ctx 는 리더직 상실 시 취소됨 |
-| `OnStoppedLeading` | X | nil | 리더직을 잃었을 때 호출 |
+| `OnStoppedLeading` | X | nil | Run 종료 시 항상 호출(리더가 된 적 없어도). 정리는 멱등이어야 함 (함정 7) |
 | `OnNewLeader` | X | nil | 관찰된 리더가 바뀔 때마다 호출(관측용) |
 
 에러 계약:
@@ -233,6 +233,17 @@ client-go `LeaderElector.Run(ctx)` 은 "ctx 취소 **또는** 리더직 상실" 
   철저히 지켜 리더 전환 시 상태를 확실히 리셋해야 한다.
 
 `-mode`(또는 `LE_MODE`) 로 고르고, `make demo` / `make demo-rejoin` 으로 각각 배포해 볼 수 있다.
+
+### 7. OnStoppedLeading 은 리더가 아니어도 호출된다 - 설명만
+
+client-go 콜백 문서가 명시한다: "OnStoppedLeading ... is always called when the LeaderElector
+exits, even if it did not start leading. Users should not assume that OnStoppedLeading is only
+called after OnStartedLeading." 즉 리더가 된 적 없는 팔로워가 종료해도 이 콜백이 불린다
+(`Run` 안 defer). 따라서 **OnStoppedLeading 의 정리 로직은 멱등이어야 하고, OnStartedLeading 이
+먼저 실행됐다고 가정하면 안 된다**(예: OnStartedLeading 에서 연 핸들을 닫는다면 nil 여부를 먼저
+확인). 이 순서 보장은 래퍼로 흉내낼 수 없다 - OnStartedLeading/OnNewLeader 는 client-go 가 별도
+goroutine 으로 띄우고 OnStoppedLeading 만 메인 goroutine defer 라, "리더였는지" 를 race 없이
+알려주는 동기 신호가 없기 때문이다. 그래서 이 스니펫은 client-go 계약을 그대로 노출한다.
 
 ## 참고 자료
 

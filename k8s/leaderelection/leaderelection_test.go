@@ -114,9 +114,10 @@ func TestRunUntilCancelledDoesNotRetryConfigError(t *testing.T) {
 	}
 }
 
-// 리더가 된 적 없는 경우(취소된 ctx -> acquire 진입 전 종료) OnStoppedLeading 은 호출되면 안 된다.
-// client-go 는 defer 로 무조건 부르지만 래퍼가 startedLeading 가드로 막는다.
-func TestOnStoppedLeadingGuardedForFollower(t *testing.T) {
+// client-go 계약: OnStoppedLeading 은 Run 종료 시 항상 호출된다(리더가 된 적 없어도).
+// 미리 취소한 ctx 는 acquire 진입 전 종료라 리더가 되지 못하지만(OnStartedLeading 0 회),
+// defer 로 OnStoppedLeading 은 1 회 불린다. 래퍼가 이를 그대로 전달함을 확인한다.
+func TestOnStoppedLeadingAlwaysCalledOnExit(t *testing.T) {
 	var started, stopped atomic.Int32
 	cfg := Config{
 		Namespace:        "ns",
@@ -133,9 +134,9 @@ func TestOnStoppedLeadingGuardedForFollower(t *testing.T) {
 		t.Fatalf("Run = %v, want nil", err)
 	}
 	if got := started.Load(); got != 0 {
-		t.Errorf("OnStartedLeading 호출 %d 회, want 0", got)
+		t.Errorf("OnStartedLeading 호출 %d 회, want 0 (리더가 되지 못함)", got)
 	}
-	if got := stopped.Load(); got != 0 {
-		t.Errorf("OnStoppedLeading 호출 %d 회, want 0 (팔로워는 정리 콜백을 받으면 안 됨)", got)
+	if got := stopped.Load(); got != 1 {
+		t.Errorf("OnStoppedLeading 호출 %d 회, want 1 (client-go 는 종료 시 항상 호출)", got)
 	}
 }

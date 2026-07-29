@@ -19,7 +19,6 @@ package leaderelection
 import (
 	"context"
 	"errors"
-	"sync/atomic"
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -74,9 +73,9 @@ type Config struct {
 	// 이 ctx 를 존중해 종료해야 한다. 이 함수는 블록해도 되고, 반환하거나 ctx 가
 	// 취소되면 리더 작업이 끝난 것으로 본다.
 	OnStartedLeading func(ctx context.Context)
-	// OnStoppedLeading 은 이 인스턴스가 실제로 리더였다가 그 자리를 잃었을 때(갱신 실패,
-	// ctx 취소 등) 호출된다. 리더가 된 적 없는 팔로워에서는 호출되지 않는다. 리더 전용
-	// 자원을 정리하는 자리다.
+	// OnStoppedLeading 은 리더 전용 자원을 정리하는 자리다. 단, client-go 계약상 이 콜백은
+	// Run 이 끝날 때 항상 호출된다 - 이 인스턴스가 리더가 된 적 없어도(팔로워가 종료해도)
+	// 불린다. OnStartedLeading 이 먼저 불렸다고 가정하지 말고, 정리 로직은 멱등이어야 한다.
 	OnStoppedLeading func()
 	// OnNewLeader 는 관찰된 리더가 바뀔 때마다 호출된다(자기 자신이 리더가 된
 	// 경우 포함). 로깅/관측용으로 유용하다.
@@ -140,10 +139,6 @@ func Run(ctx context.Context, client kubernetes.Interface, cfg Config) error {
 		},
 	}
 
-	// client-go 는 Run 에서 OnStoppedLeading 을 defer 로 무조건 부른다. 리더가 된 적 없는
-	// 팔로워가 종료(acquire 실패)해도 불리므로, 실제로 리딩을 시작한 경우에만 전달한다.
-	var startedLeading atomic.Bool
-
 	elector, err := leaderelection.NewLeaderElector(leaderelection.LeaderElectionConfig{
 		Lock:            lock,
 		ReleaseOnCancel: true,
@@ -152,13 +147,12 @@ func Run(ctx context.Context, client kubernetes.Interface, cfg Config) error {
 		RetryPeriod:     cfg.RetryPeriod,
 		Callbacks: leaderelection.LeaderCallbacks{
 			OnStartedLeading: func(ctx context.Context) {
-				startedLeading.Store(true)
 				if cfg.OnStartedLeading != nil {
 					cfg.OnStartedLeading(ctx)
 				}
 			},
 			OnStoppedLeading: func() {
-				if startedLeading.Load() && cfg.OnStoppedLeading != nil {
+				if cfg.OnStoppedLeading != nil {
 					cfg.OnStoppedLeading()
 				}
 			},
