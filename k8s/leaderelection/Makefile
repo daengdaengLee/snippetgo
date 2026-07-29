@@ -17,6 +17,11 @@ GOARCH    ?= $(shell go env GOARCH)
 
 .DEFAULT_GOAL := help
 
+# demo 의 전제 조건은 순서가 곧 정확성이다(클러스터 생성 -> 이미지 적재 -> 배포).
+# make -j 로 부르면 전제 조건이 병렬로 떠서 deploy 가 클러스터도 없이 실행되고,
+# load 는 "no nodes found" 로 실패한다. 그래서 이 Makefile 은 병렬 실행을 금지한다.
+.NOTPARALLEL:
+
 .PHONY: help
 help: ## 사용 가능한 타깃 목록
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
@@ -48,6 +53,10 @@ load: ## 빌드한 이미지를 kind 노드에 적재
 deploy: ## kustomize 로 배포(KUSTOMIZE_DIR) 후 롤아웃 대기
 	kubectl apply -k $(KUSTOMIZE_DIR)
 	kubectl -n $(NAMESPACE) rollout status deploy/leaderelection --timeout=90s
+
+.PHONY: deploy-rejoin
+deploy-rejoin: ## 이미 뜬 클러스터에 rejoin overlay 만 재배포(클러스터 재생성 없음)
+	$(MAKE) deploy KUSTOMIZE_DIR=manifests/overlays/rejoin
 
 .PHONY: status
 status: ## Lease 와 Pod 상태 확인
