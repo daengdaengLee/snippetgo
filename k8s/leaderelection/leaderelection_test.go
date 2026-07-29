@@ -140,3 +140,137 @@ func TestOnStoppedLeadingAlwaysCalledOnExit(t *testing.T) {
 		t.Errorf("OnStoppedLeading 호출 %d 회, want 1 (client-go 는 종료 시 항상 호출)", got)
 	}
 }
+
+// 여기부터는 선출 루프를 실제로 돌리는 테스트다. fake clientset 이 Lease 를
+// get/create/update 하는 경로를 그대로 태우므로 클러스터 없이도 획득/상실/재경쟁을
+// 재현할 수 있다. 헬퍼는 helper_test.go 참고.
+
+// 리더 획득 성공 경로: OnStartedLeading 이 정확히 한 번 불리고, ctx 취소로 끝나면 nil 이다.
+func TestRunAcquiresLeadership(t *testing.T) {
+	var started atomic.Int32
+	cfg := fastConfig()
+	cfg.OnStartedLeading = func(ctx context.Context) {
+		started.Add(1)
+		<-ctx.Done()
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- Run(ctx, newRenewBlocker().client, cfg) }()
+
+	awaitCount(t, &started, 1, 5*time.Second, "OnStartedLeading")
+	cancel()
+
+	if err := awaitErr(t, errCh, 5*time.Second, "Run"); err != nil {
+		t.Errorf("Run = %v, want nil (ctx 취소는 정상 종료)", err)
+	}
+	if got := started.Load(); got != 1 {
+		t.Errorf("OnStartedLeading 호출 %d 회, want 1", got)
+	}
+}
+
+// 리더가 된 뒤 갱신이 실패하면 ctx 는 살아 있으므로 ErrLostLease 여야 한다.
+// nil(정상 종료) 과 구분되는 이 신호가 exit 모드의 근거다.
+func TestRunReturnsErrLostLeaseOnRenewFailure(t *testing.T) {
+	blocker := newRenewBlocker()
+
+	var started atomic.Int32
+	cfg := fastConfig()
+	cfg.OnStartedLeading = func(ctx context.Context) {
+		started.Add(1)
+		<-ctx.Done()
+	}
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- Run(context.Background(), blocker.client, cfg) }()
+
+	awaitCount(t, &started, 1, 5*time.Second, "OnStartedLeading")
+	blocker.Block() // 이제부터 갱신 실패 -> 리더직 비자발적 상실
+
+	if err := awaitErr(t, errCh, 10*time.Second, "Run"); !errors.Is(err, ErrLostLease) {
+		t.Errorf("Run = %v, want ErrLostLease", err)
+	}
+}
+
+// RunUntilCancelled 의 핵심 계약: 리더직을 잃어도 같은 프로세스가 다시 후보로 참여해
+// 재획득한다(OnStartedLeading 이 두 번째로 불린다).
+func TestRunUntilCancelledRejoinsAfterLostLease(t *testing.T) {
+	blocker := newRenewBlocker()
+
+	var started atomic.Int32
+	cfg := fastConfig()
+	cfg.OnStartedLeading = func(ctx context.Context) {
+		started.Add(1)
+		<-ctx.Done()
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- RunUntilCancelled(ctx, blocker.client, cfg) }()
+
+	awaitCount(t, &started, 1, 5*time.Second, "최초 OnStartedLeading")
+	blocker.Block()                    // 상실 유도
+	time.Sleep(600 * time.Millisecond) // 상실이 확정될 시간
+	blocker.Unblock()                  // 재획득 허용
+
+	awaitCount(t, &started, 2, 10*time.Second, "재경쟁 후 OnStartedLeading")
+
+	cancel()
+	if err := awaitErr(t, errCh, 5*time.Second, "RunUntilCancelled"); err != nil {
+		t.Errorf("RunUntilCancelled = %v, want nil", err)
+	}
+}
+
+// WaitForLeaderWork 를 켜면 Run 이 OnStartedLeading 종료를 기다리므로, rejoin 으로
+// 재획득해도 이전 리더 작업과 새 리더 작업이 겹치지 않는다.
+//
+// 반대 방향(기본값 false 에서 겹침이 "발생함") 은 단언하지 않는다 - 재획득 속도에 따라
+// 겹치지 않을 수도 있는 타이밍 의존 현상이라 flaky 한 테스트가 된다.
+func TestRunUntilCancelledWaitForLeaderWorkPreventsOverlap(t *testing.T) {
+	blocker := newRenewBlocker()
+
+	var started, concurrent, maxConcurrent atomic.Int32
+	cfg := fastConfig()
+	cfg.WaitForLeaderWork = true
+	cfg.OnStartedLeading = func(ctx context.Context) {
+		started.Add(1)
+		cur := concurrent.Add(1)
+		for {
+			max := maxConcurrent.Load()
+			if cur <= max || maxConcurrent.CompareAndSwap(max, cur) {
+				break
+			}
+		}
+		<-ctx.Done()
+		// 리더 작업이 정리에 시간을 쓰는 현실적인 상황. 대기가 없으면 이 사이에
+		// 다음 리더 작업이 시작돼 동시 실행이 2 가 된다.
+		time.Sleep(400 * time.Millisecond)
+		concurrent.Add(-1)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- RunUntilCancelled(ctx, blocker.client, cfg) }()
+
+	awaitCount(t, &started, 1, 5*time.Second, "최초 OnStartedLeading")
+	blocker.Block()
+	time.Sleep(600 * time.Millisecond)
+	blocker.Unblock()
+
+	awaitCount(t, &started, 2, 15*time.Second, "재경쟁 후 OnStartedLeading")
+
+	if got := maxConcurrent.Load(); got != 1 {
+		t.Errorf("최대 동시 실행 = %d, want 1 (WaitForLeaderWork 가 겹침을 막아야 한다)", got)
+	}
+
+	cancel()
+	if err := awaitErr(t, errCh, 10*time.Second, "RunUntilCancelled"); err != nil {
+		t.Errorf("RunUntilCancelled = %v, want nil", err)
+	}
+}
