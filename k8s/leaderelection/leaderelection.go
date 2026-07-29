@@ -19,17 +19,20 @@ package leaderelection
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/tools/leaderelection"
+	// 이 패키지 이름과 같아서 별칭을 준다. k8sle 로 시작하면 client-go 쪽임이 분명해진다.
+	k8sle "k8s.io/client-go/tools/leaderelection"
 	"k8s.io/client-go/tools/leaderelection/resourcelock"
 )
 
 // 기본 임대 타이밍. client-go 가 권장하는 값을 그대로 쓴다.
 //
-// 관계식은 항상 RetryPeriod < RenewDeadline < LeaseDuration 이어야 한다.
+// 관계식은 항상 RetryPeriod * JitterFactor(1.2) < RenewDeadline < LeaseDuration
+// 이어야 한다(단순 대소가 아니라 지터를 곱한 값과 비교한다).
 // LeaseDuration 은 리더가 죽은 뒤 다른 인스턴스가 임대를 빼앗기까지의 상한(=failover
 // 지연) 이고, RenewDeadline 은 현재 리더가 이 시간 안에 갱신에 실패하면 스스로
 // 리더직을 내려놓는 기준이다. RetryPeriod 는 획득/갱신 재시도 간격이다.
@@ -51,7 +54,7 @@ var ErrLostLease = errors.New("leaderelection: 리더직을 상실했다 (갱신
 
 // Config 는 리더 선출 한 판에 필요한 설정이다.
 //
-// Namespace/LeaseName/Identity 는 필수이고, 나머지 타이밍 값은 0 이면
+// Namespace/LeaseName/Identity 는 필수이고, 나머지 타이밍 값은 0 이하면
 // Default* 상수로 채워진다. 콜백은 nil 이어도 된다(아무 것도 하지 않음).
 type Config struct {
 	// Namespace 는 Lease 오브젝트가 생성/조회되는 네임스페이스다.
@@ -63,10 +66,22 @@ type Config struct {
 	// (Downward API 의 metadata.name) 을 쓴다. 그룹 안에서 유일해야 한다.
 	Identity string
 
-	// LeaseDuration/RenewDeadline/RetryPeriod 는 0 이면 Default* 로 대체된다.
+	// LeaseDuration/RenewDeadline/RetryPeriod 는 0 이하면 Default* 로 대체된다.
 	LeaseDuration time.Duration
 	RenewDeadline time.Duration
 	RetryPeriod   time.Duration
+
+	// WaitForLeaderWork 가 true 면 Run 은 OnStartedLeading 이 반환할 때까지 기다린 뒤
+	// 반환한다. RunUntilCancelled 로 재경쟁할 때 이전 리더 작업과 새 리더 작업이
+	// 겹치는 것을 막는다(README 함정 5).
+	//
+	// 기본값 false 는 client-go 의 동작을 그대로 노출한다 - client-go 는
+	// OnStartedLeading 을 별도 goroutine 으로 띄우고 그 종료를 기다리지 않으므로,
+	// 상실 직후 같은 프로세스가 재획득하면 두 리더 작업이 짧게 겹칠 수 있다.
+	//
+	// 주의: true 로 켜면 OnStartedLeading 이 넘어온 ctx 취소를 존중하지 않을 때
+	// Run 이 무한히 블록한다. 콜백이 ctx 를 확실히 따르는 경우에만 켤 것.
+	WaitForLeaderWork bool
 
 	// OnStartedLeading 은 이 인스턴스가 리더가 됐을 때 호출된다. 넘어온 ctx 는
 	// 리더직을 잃거나 상위 ctx 가 취소되면 함께 취소되므로, 리더 전용 작업 루프는
@@ -118,6 +133,9 @@ func (c Config) validate() error {
 //   - 리더직 비자발적 상실(갱신 실패): ctx 는 살아 있는데 client-go 의 선출 루프가
 //     리더 임대를 놓쳐 반환한 경우로, ErrLostLease 를 반환한다.
 //
+// cfg.WaitForLeaderWork 가 true 면 위 시점에 더해 OnStartedLeading 이 반환할 때까지
+// 기다린 뒤 반환한다(반환값은 달라지지 않는다).
+//
 // 설정이 잘못된 경우 ErrInvalidConfig 등을 반환한다. 리더직을 잃어도 같은 프로세스에서
 // 계속 재경쟁하려면 RunUntilCancelled 를 쓴다.
 func Run(ctx context.Context, client kubernetes.Interface, cfg Config) error {
@@ -125,6 +143,12 @@ func Run(ctx context.Context, client kubernetes.Interface, cfg Config) error {
 	if err := cfg.validate(); err != nil {
 		return err
 	}
+
+	// WaitForLeaderWork 용 신호. leaderWorkDone 은 OnStartedLeading 이 반환할 때 닫히고,
+	// leaderWorkStarted 는 그 콜백이 시작되기라도 했는지를 알려준다. 리더가 된 적 없으면
+	// leaderWorkDone 은 영영 닫히지 않으므로 started 를 먼저 확인해야 한다.
+	var leaderWorkStarted atomic.Bool
+	leaderWorkDone := make(chan struct{})
 
 	// Lease 타입 락. EventRecorder 를 nil 로 두면 이벤트를 남기지 않으므로
 	// RBAC 에 events 권한이 필요 없다(leases 권한만 있으면 된다).
@@ -139,14 +163,16 @@ func Run(ctx context.Context, client kubernetes.Interface, cfg Config) error {
 		},
 	}
 
-	elector, err := leaderelection.NewLeaderElector(leaderelection.LeaderElectionConfig{
+	elector, err := k8sle.NewLeaderElector(k8sle.LeaderElectionConfig{
 		Lock:            lock,
 		ReleaseOnCancel: true,
 		LeaseDuration:   cfg.LeaseDuration,
 		RenewDeadline:   cfg.RenewDeadline,
 		RetryPeriod:     cfg.RetryPeriod,
-		Callbacks: leaderelection.LeaderCallbacks{
+		Callbacks: k8sle.LeaderCallbacks{
 			OnStartedLeading: func(ctx context.Context) {
+				leaderWorkStarted.Store(true)
+				defer close(leaderWorkDone)
 				if cfg.OnStartedLeading != nil {
 					cfg.OnStartedLeading(ctx)
 				}
@@ -171,6 +197,18 @@ func Run(ctx context.Context, client kubernetes.Interface, cfg Config) error {
 	// (client-go docstring: "stopped by ctx or it has stopped holding the leader lease").
 	// 자체적으로 에러를 돌려주지 않으므로 종료 원인은 ctx 상태로 구분한다.
 	elector.Run(ctx)
+
+	// client-go 는 OnStartedLeading 을 별도 goroutine 으로 띄우고 그 종료를 기다리지
+	// 않는다. 옵션이 켜져 있으면 여기서 기다려, 호출자가 Run 반환 뒤 곧바로 재경쟁해도
+	// 이전 리더 작업과 겹치지 않게 한다.
+	//
+	// 남는 창: acquire 직후 ctx 가 취소되면 goroutine 이 leaderWorkStarted 를 세팅하기
+	// 전에 elector.Run 이 반환할 수 있고, 그때는 기다리지 않는다. acquire 에 성공하면
+	// renew 가 최소 한 사이클은 돌기 때문에 실무에서 문제되는 창은 아니다.
+	if cfg.WaitForLeaderWork && leaderWorkStarted.Load() {
+		<-leaderWorkDone
+	}
+
 	if err := ctx.Err(); err != nil {
 		if errors.Is(err, context.Canceled) {
 			return nil // SIGTERM 등 정상 취소
@@ -189,6 +227,7 @@ func Run(ctx context.Context, client kubernetes.Interface, cfg Config) error {
 //
 // 주의: 리더가 잡고 있던 in-memory 상태가 남은 채 재경쟁하므로, 리더 전용 작업은
 // OnStartedLeading 의 ctx 취소를 존중해 확실히 정리한 뒤 다음 리더로 넘어가야 한다.
+// 이전 리더 작업이 끝난 뒤에만 다음 판을 시작하고 싶으면 cfg.WaitForLeaderWork 를 켠다.
 func RunUntilCancelled(ctx context.Context, client kubernetes.Interface, cfg Config) error {
 	for {
 		err := Run(ctx, client, cfg)
