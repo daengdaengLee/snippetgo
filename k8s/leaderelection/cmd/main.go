@@ -34,10 +34,24 @@ func main() {
 	mode := flag.String("mode", cmp.Or(os.Getenv("LE_MODE"), "exit"), "리더직 상실 처리: exit | rejoin")
 	flag.Parse()
 
+	// 설정 오류는 클라이언트를 만들기 전에 걸러낸다. 뒤로 미루면 클러스터 밖에서
+	// 실행할 때 kubeconfig 로드 실패가 먼저 터져 진짜 원인이 가려진다.
+	if *mode != "exit" && *mode != "rejoin" {
+		log.Fatalf("알 수 없는 -mode=%q (exit | rejoin)", *mode)
+	}
+
 	// identity 는 그룹 안에서 유일해야 한다. 파드 안이면 Downward API 로 주입한
-	// POD_NAME 을 쓰고, 없으면 호스트네임으로 대체한다.
-	hostname, _ := os.Hostname()
-	identity := cmp.Or(os.Getenv("POD_NAME"), hostname)
+	// POD_NAME 을 쓰고, 없으면 호스트네임으로 대체한다. 둘 다 없으면 유일성을
+	// 보장할 수 없으므로 여기서 멈춘다(README 함정 4).
+	podName := os.Getenv("POD_NAME")
+	hostname, err := os.Hostname()
+	if podName == "" && err != nil {
+		log.Fatalf("identity 를 정할 수 없다: POD_NAME 이 비었고 hostname 조회도 실패했다: %v", err)
+	}
+	identity := cmp.Or(podName, hostname)
+	if identity == "" {
+		log.Fatal("identity 를 정할 수 없다: POD_NAME 과 hostname 이 모두 비었다")
+	}
 	namespace := cmp.Or(os.Getenv("POD_NAMESPACE"), "default")
 	leaseName := cmp.Or(os.Getenv("LEASE_NAME"), "snippetgo-leaderelection")
 
@@ -90,6 +104,7 @@ func main() {
 			log.Fatalf("[%s] 리더 선출 종료(에러): %v", identity, err)
 		}
 	default:
+		// 위에서 이미 걸렀다. 모드를 추가하면서 검증을 빠뜨리는 것을 막는 방어선이다.
 		log.Fatalf("알 수 없는 -mode=%q (exit | rejoin)", *mode)
 	}
 	log.Printf("[%s] 종료", identity)
