@@ -26,6 +26,33 @@ Kubernetes 는 이를 위한 분산 락 프리미티브로 `coordination.k8s.io`
    pod-a 가 죽으면 -> 임대 만료/반납 -> pod-b 또는 pod-c 가 이어받음(failover)
 ```
 
+## 사전 준비
+
+`make demo` 는 Docker, kubectl, kind 를 쓴다. 라이브러리로만 쓸 거면 필요 없다.
+
+```bash
+# kind - Go 로 설치(버전을 고정할 수 있어 편하다)
+go install sigs.k8s.io/kind@v0.32.0
+export PATH=$PATH:$(go env GOPATH)/bin   # 설치 위치를 PATH 에 넣는다
+
+# kind - 릴리스 바이너리로 설치할 때(위 대신)
+# curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.32.0/kind-linux-amd64
+# chmod +x ./kind && sudo mv ./kind /usr/local/bin/kind
+
+# kubectl - 없다면
+# curl -LO "https://dl.k8s.io/release/$(curl -sL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+# chmod +x kubectl && sudo mv kubectl /usr/local/bin/kubectl
+
+# 확인
+kind version
+kubectl version --client
+docker info          # 데몬이 떠 있어야 한다
+```
+
+`make demo` 는 kind 노드 이미지(`kindest/node`) 를 Docker Hub 에서 받는다. 사내 프록시나
+격리된 네트워크라면 `docker.io` 와 그 blob CDN 접근이 열려 있어야 한다. macOS/Windows 는
+Docker Desktop 이 떠 있으면 되고, 리눅스는 현재 사용자가 docker 그룹에 있어야 한다.
+
 ## 빠른 시작
 
 kind + Docker 로 끝까지 한 번에 돌려본다(정리 -> 클러스터 구축 -> 이미지 빌드/적재 -> 배포):
@@ -76,6 +103,7 @@ func RunUntilCancelled(ctx context.Context, client kubernetes.Interface, cfg Con
 | `LeaseDuration` | X | `15s` | 리더가 죽은 뒤 임대를 빼앗기까지의 상한(=failover 지연) |
 | `RenewDeadline` | X | `10s` | 리더가 이 시간 안에 갱신 실패 시 스스로 리더직을 내려놓음 |
 | `RetryPeriod` | X | `2s` | 획득/갱신 재시도 간격 |
+| `WaitForLeaderWork` | X | `false` | true 면 Run 이 OnStartedLeading 종료를 기다린 뒤 반환 (함정 5) |
 | `OnStartedLeading` | X | nil | 리더가 됐을 때 호출. 넘어온 ctx 는 리더직 상실 시 취소됨 |
 | `OnStoppedLeading` | X | nil | Run 종료 시 항상 호출(리더가 된 적 없어도). 정리는 멱등이어야 함 (함정 7) |
 | `OnNewLeader` | X | nil | 관찰된 리더가 바뀔 때마다 호출(관측용) |
@@ -113,6 +141,7 @@ func RunUntilCancelled(ctx context.Context, client kubernetes.Interface, cfg Con
 | --- | --- |
 | `make demo` | 기존 클러스터 정리 -> kind 생성 -> 이미지 빌드/적재 -> 배포 (`exit` 모드) |
 | `make demo-rejoin` | 위와 같되 rejoin overlay 로 배포 |
+| `make deploy-rejoin` | 이미 뜬 클러스터에 rejoin overlay 만 재배포(클러스터 재생성 없음) |
 | `make logs` | 모든 Pod 로그 실시간(리더 관찰) |
 | `make status` | Lease 1 개와 Pod 3 개 상태 |
 | `make leader` | 현재 리더(`Lease.holderIdentity`) 출력 |
@@ -209,14 +238,28 @@ client-go `NewLeaderElector` 가 강제한다. 예를 들어 `RetryPeriod=9s, Re
 API 의 `metadata.name`(Pod 이름) 을 `POD_NAME` 으로 주입해 쓴다. `cmd/main.go` 는 `POD_NAME`
 이 없으면 호스트네임으로 대체한다.
 
-### 5. `OnStartedLeading` 의 ctx 를 존중하라 - cmd 에서 구현
+### 5. `OnStartedLeading` 의 ctx 를 존중하라 - cmd 에서 구현 + 옵션 제공
 
 리더 전용 작업은 콜백으로 넘어온 `ctx` 가 취소되면(리더직 상실/종료) **반드시 멈춰야 한다**.
 멈추지 않으면 리더가 바뀐 뒤에도 옛 리더가 작업을 계속해 함정 1 을 악화시킨다. `cmd/main.go` 의
-`runLeaderWork` 는 `ticker` 루프에서 `ctx.Done()` 을 항상 확인한다. 다만 client-go 가
-`OnStartedLeading` 을 detached 고루틴으로 띄우므로, rejoin 모드에서 같은 Pod 가 상실 직후
-재획득하면 이전 작업 고루틴이 완전히 끝나기 전 새 고루틴과 아주 짧게 겹칠 수 있다. 이 겹침은
-코드로 완전히 없앨 수 없으니, 실전 싱글톤 작업이라면 멱등성/펜싱으로 중복 수행을 흡수해야 한다.
+`runLeaderWork` 는 `ticker` 루프에서 `ctx.Done()` 을 항상 확인한다.
+
+그런데 ctx 를 존중해도 겹침이 남는다. client-go 는 `OnStartedLeading` 을 detached 고루틴으로
+띄우고 그 종료를 기다리지 않은 채 `Run` 이 반환하므로, rejoin 모드에서 같은 Pod 가 상실 직후
+재획득하면 이전 작업 고루틴이 정리를 끝내기 전에 새 고루틴이 시작될 수 있다.
+
+`Config.WaitForLeaderWork` 로 고른다.
+
+- **기본값 `false`**: client-go 동작을 그대로 노출한다. 위 겹침이 생길 수 있다.
+- **`true`**: `Run` 이 `OnStartedLeading` 반환까지 기다린 뒤 반환하므로, `RunUntilCancelled`
+  가 다음 판을 시작할 때 이전 리더 작업은 이미 끝나 있다. 겹침이 사라진다.
+
+트레이드오프가 있어서 기본값을 `false` 로 뒀다. `true` 인데 콜백이 ctx 취소를 존중하지 않으면
+`Run` 이 무한히 블록한다 - 즉 이 옵션은 함정 5 의 전제(ctx 를 지킨다) 를 지켜야만 안전하다.
+또 acquire 직후 ctx 가 취소되는 아주 좁은 경우에는 대기가 걸리지 않을 수 있다.
+
+어느 쪽을 고르든, 실전 싱글톤 작업이라면 멱등성/펜싱으로 중복 수행을 흡수해야 한다
+(함정 1 과 같은 결론이다). 이 옵션은 겹침 창을 줄여줄 뿐 상호 배제를 보장하지 않는다.
 
 ### 6. 리더직 상실 처리: exit vs rejoin - 구현됨
 
