@@ -1,25 +1,30 @@
 # k8s Lease 기반 리더 선출 스니펫 - 로컬 kind 데모용 Makefile.
 #
-# 전형적 흐름: make demo (정리 -> 클러스터 구축 -> 이미지 빌드/적재 -> 배포)
+# 전형적 흐름: make demo (정리(클러스터/로컬 이미지) -> 클러스터 구축 -> 이미지 빌드/적재 -> 배포)
 # 그다음 make logs 로 한 Pod 만 리더가 되는 것을 관찰한다.
 
-IMAGE     ?= snippetgo/leaderelection:dev
-CLUSTER   ?= snippetgo-le
-# NAMESPACE/LEASE_NAME 은 manifests/ 에 하드코딩된 값과 반드시 일치해야 한다
-# (매니페스트가 source of truth). 이 변수만 바꿔도 배포 위치는 옮겨지지 않는다.
-NAMESPACE  ?= snippetgo-leaderelection
-LEASE_NAME ?= snippetgo-leaderelection
+CLUSTER ?= snippetgo-le
 # 배포할 kustomize 디렉터리. base 는 exit, overlays/rejoin 은 rejoin 모드.
 KUSTOMIZE_DIR ?= manifests/base
+# 아래 세 값은 manifests/ 의 값을 미러링하는 상수다(매니페스트가 source of truth).
+# knob 이 아니라는 뜻으로 := 를 쓰지만, := 가 막는 건 환경변수 상속뿐이다 - 커맨드라인
+# 변수(make IMAGE=... load) 는 override 없이는 못 막으니 안 바꾸는 게 규칙이다. 특히
+# IMAGE 를 오버라이드하면 빌드/적재 태그만 바뀌고 배포 매니페스트는 그대로라 롤아웃이
+# 90s 타임아웃으로 실패한다(ErrImageNeverPull).
+NAMESPACE  := snippetgo-leaderelection
+LEASE_NAME := snippetgo-leaderelection
+IMAGE      := snippetgo/leaderelection:dev
 # 바이너리는 kind 노드(리눅스) 에서 돌므로 GOOS 는 linux 로 고정하고
 # GOARCH 는 호스트에 맞춰 kind 노드 아키텍처와 일치시킨다.
-GOARCH    ?= $(shell go env GOARCH)
+GOARCH ?= $(shell go env GOARCH)
 
 .DEFAULT_GOAL := help
 
-# demo 의 전제 조건은 순서가 곧 정확성이다(클러스터 생성 -> 이미지 적재 -> 배포).
-# make -j 로 부르면 전제 조건이 병렬로 떠서 deploy 가 클러스터도 없이 실행되고,
-# load 는 "no nodes found" 로 실패한다. 그래서 이 Makefile 은 병렬 실행을 금지한다.
+# demo 의 전제 조건은 순서가 곧 정확성이다(정리 -> 클러스터 생성 -> 배포).
+# make -j 로 부르면 전제 조건이 병렬로 떠서 clean(-> kind-down) 이 kind-up 이 만들고 있는
+# 클러스터를 지우거나, kind create 가 "already exist" 로 실패한다. 이 순서는 의존 그래프로
+# 표현할 수 없으므로(kind-up 은 클러스터가 이미 있으면 실패해서 load 의 전제조건이 될 수 없다)
+# 목록 순서로만 보장된다. 그래서 이 Makefile 은 병렬 실행을 금지한다.
 .NOTPARALLEL:
 
 .PHONY: help
@@ -31,10 +36,10 @@ help: ## 사용 가능한 타깃 목록
 build: ## 정적 리눅스 바이너리를 bin/leaderelection 로 빌드
 	CGO_ENABLED=0 GOOS=linux GOARCH=$(GOARCH) go build -o bin/leaderelection ./cmd
 
+# --platform 을 주는 이유: 빌드한 바이너리(GOARCH)와 이미지 플랫폼을 맞춘다.
+# DOCKER_DEFAULT_PLATFORM 이 다르게 잡혀 있어도 exec format error 를 피한다.
 .PHONY: docker-build
 docker-build: build ## 바이너리를 복사한 컨테이너 이미지 빌드
-	# 빌드한 바이너리(GOARCH)와 이미지 플랫폼을 맞춘다. DOCKER_DEFAULT_PLATFORM 이
-	# 다르게 잡혀 있어도 exec format error 를 피한다.
 	docker build --platform=linux/$(GOARCH) -t $(IMAGE) .
 
 .PHONY: kind-up
@@ -46,16 +51,20 @@ kind-down: ## kind 클러스터 삭제(없어도 무시)
 	-kind delete cluster --name $(CLUSTER)
 
 .PHONY: load
-load: ## 빌드한 이미지를 kind 노드에 적재
+load: docker-build ## 이미지 빌드 후 kind 노드에 적재
 	kind load docker-image $(IMAGE) --name $(CLUSTER)
 
+# rollout restart 가 필요한 이유: 태그가 :dev 로 고정이라 apply 만으로는 새 이미지가
+# 반영되지 않는다(spec 변화가 없어 롤아웃이 안 난다). 이미 돌고 있는 Pod 를 방금 적재한
+# 이미지로 갈아치운다.
 .PHONY: deploy
-deploy: ## kustomize 로 배포(KUSTOMIZE_DIR) 후 롤아웃 대기
+deploy: load ## 빌드/적재 -> apply -> Pod 재시작 -> 롤아웃 대기(kind 클러스터 필수)
 	kubectl apply -k $(KUSTOMIZE_DIR)
+	kubectl -n $(NAMESPACE) rollout restart deploy/leaderelection
 	kubectl -n $(NAMESPACE) rollout status deploy/leaderelection --timeout=90s
 
 .PHONY: deploy-rejoin
-deploy-rejoin: ## 이미 뜬 클러스터에 rejoin overlay 만 재배포(클러스터 재생성 없음)
+deploy-rejoin: ## 클러스터 재생성 없이 rejoin overlay 재배포(빌드/적재/Pod 재시작 포함)
 	$(MAKE) deploy KUSTOMIZE_DIR=manifests/overlays/rejoin
 
 .PHONY: status
@@ -77,17 +86,40 @@ kill-leader: ## 현재 리더 Pod 를 삭제해 failover 유도
 	echo "리더 Pod 삭제: $$leader"; \
 	kubectl -n $(NAMESPACE) delete pod "$$leader"
 
+# renew 는 Lease update 이므로 update 만 막으면 ctx 는 살아 있는 채 갱신만 실패한다
+# = API 파티션 없이 비자발적 상실을 재현. rules 는 하나뿐이라 인덱스 0 을 쓴다.
+.PHONY: break-renew
+break-renew: ## Role 에서 update 권한을 회수해 비자발적 리더직 상실 유도
+	kubectl -n $(NAMESPACE) patch role leaderelection --type=json \
+		-p='[{"op":"replace","path":"/rules/0/verbs","value":["get","create"]}]'
+	@echo "Role 이 훼손된 상태다. 복구: make fix-renew"
+	@echo "  주의: 인수 없는 make deploy 는 base(exit) 를 적용한다. rejoin 유지는 make deploy-rejoin, 최후에는 make demo."
+
+.PHONY: fix-renew
+fix-renew: ## update 권한을 복구해 정상 상태로 되돌린다
+	kubectl -n $(NAMESPACE) patch role leaderelection --type=json \
+		-p='[{"op":"replace","path":"/rules/0/verbs","value":["get","create","update"]}]'
+	@echo "update 권한 복구 완료"
+
+# demo 의 전제조건은 clean kind-up deploy 로 충분하다. deploy: load, load: docker-build,
+# docker-build: build 가 걸려 있어 빌드/적재는 deploy 가 끌고 온다. kind-up 만 목록에
+# 남기는 이유는 그것만 의존 그래프로 표현할 수 없기 때문이다(위 .NOTPARALLEL 주석 참고).
 .PHONY: demo
-demo: kind-down kind-up docker-build load deploy ## 정리 -> 구축 -> 빌드/적재 -> 배포(base=exit)
+demo: clean kind-up deploy ## 정리(클러스터/이미지) -> 구축 -> 빌드/적재 -> 배포(base=exit)
 	@echo ""
 	@echo "배포 완료. 리더를 관찰하려면: make logs"
 	@echo "현재 리더 확인:        make leader"
 	@echo "failover 실험:         make kill-leader"
+	@echo "비자발적 상실 실험:    make break-renew (복구: make fix-renew)"
 
 .PHONY: demo-rejoin
 demo-rejoin: ## demo 를 rejoin overlay 로 실행(리더직 상실 시 in-process 재경쟁)
 	$(MAKE) demo KUSTOMIZE_DIR=manifests/overlays/rejoin
 
+# 이미지도 남기지 않는다. docker-build 가 매번 재태깅하므로 demo 가 쓰는 이미지가
+# 바뀌는 건 아니고, 디스크 위생과 "빌드 실패 시 옛 이미지가 남지 않는다" 가 목적이다.
+# 이미지 삭제는 조용히 실패해야 한다 - 이미지가 없는 첫 실행이 정상 경로다.
 .PHONY: clean
-clean: kind-down ## 클러스터와 빌드 산출물 정리
+clean: kind-down ## 클러스터, 로컬 이미지, 빌드 산출물 정리
+	@docker image rm $(IMAGE) 2>/dev/null || true
 	rm -rf bin

@@ -71,16 +71,15 @@ type Config struct {
 	RenewDeadline time.Duration
 	RetryPeriod   time.Duration
 
-	// WaitForLeaderWork 가 true 면 Run 은 OnStartedLeading 이 반환할 때까지 기다린 뒤
-	// 반환한다. RunUntilCancelled 로 재경쟁할 때 이전 리더 작업과 새 리더 작업이
-	// 겹치는 것을 막는다(README 함정 5).
+	// WaitForLeaderWork 가 true 면, 리더 작업(OnStartedLeading) 이 시작됐었던 경우에 한해
+	// Run 은 그 종료까지 기다린 뒤 반환한다. 이 대기가 막아 주는 겹침은 하나뿐이다 - 같은
+	// 프로세스에서 RunUntilCancelled 이 곧바로 시작하는 다음 OnStartedLeading. Lease 반납과
+	// OnStoppedLeading 은 client-go 안에서 이 대기보다 먼저 끝나므로 다른 프로세스와의
+	// 겹침은 그대로 남는다(범위와 대가는 README 함정 5).
 	//
-	// 기본값 false 는 client-go 의 동작을 그대로 노출한다 - client-go 는
-	// OnStartedLeading 을 별도 goroutine 으로 띄우고 그 종료를 기다리지 않으므로,
-	// 상실 직후 같은 프로세스가 재획득하면 두 리더 작업이 짧게 겹칠 수 있다.
-	//
-	// 주의: true 로 켜면 OnStartedLeading 이 넘어온 ctx 취소를 존중하지 않을 때
-	// Run 이 무한히 블록한다. 콜백이 ctx 를 확실히 따르는 경우에만 켤 것.
+	// 기본값 false 는 client-go 동작(콜백을 별도 goroutine 으로 띄우고 기다리지 않음) 을
+	// 그대로 노출한다. true 로 켜면 콜백이 넘어온 ctx 취소를 존중하지 않을 때 Run 이 무한히
+	// 블록하므로, 콜백이 ctx 를 확실히 따르는 경우에만 켤 것.
 	WaitForLeaderWork bool
 
 	// OnStartedLeading 은 이 인스턴스가 리더가 됐을 때 호출된다. 넘어온 ctx 는
@@ -91,6 +90,8 @@ type Config struct {
 	// OnStoppedLeading 은 리더 전용 자원을 정리하는 자리다. 단, client-go 계약상 이 콜백은
 	// Run 이 끝날 때 항상 호출된다 - 이 인스턴스가 리더가 된 적 없어도(팔로워가 종료해도)
 	// 불린다. OnStartedLeading 이 먼저 불렸다고 가정하지 말고, 정리 로직은 멱등이어야 한다.
+	// 또 이 콜백은 WaitForLeaderWork 대기보다 먼저 불리므로, 여기서 닫는 자원을 리더 작업
+	// goroutine 이 아직 쓰고 있을 수 있다.
 	OnStoppedLeading func()
 	// OnNewLeader 는 관찰된 리더가 바뀔 때마다 호출된다(자기 자신이 리더가 된
 	// 경우 포함). 로깅/관측용으로 유용하다.
@@ -126,14 +127,15 @@ func (c Config) validate() error {
 
 // Run 은 리더 선출 한 세션에 참여하고, 아래 둘 중 먼저 오는 시점에 반환한다.
 //
-//   - ctx 가 취소됨(예: SIGTERM): 이 인스턴스가 리더였다면 Lease 를 즉시 반납하고
-//     (ReleaseOnCancel) nil 을 반환한다. 다음 리더는 LeaseDuration 만료를 기다리지 않고
-//     바로 이어받아 failover 가 빨라진다. ctx 가 데드라인 만료 등 취소가 아닌 사유로
-//     끝났다면 해당 ctx 에러를 그대로 반환한다.
+//   - ctx 가 취소됨(예: SIGTERM): nil 을 반환한다. ctx 가 데드라인 만료 등 취소가 아닌
+//     사유로 끝났다면 해당 ctx 에러를 그대로 반환한다.
 //   - 리더직 비자발적 상실(갱신 실패): ctx 는 살아 있는데 client-go 의 선출 루프가
 //     리더 임대를 놓쳐 반환한 경우로, ErrLostLease 를 반환한다.
 //
-// cfg.WaitForLeaderWork 가 true 면 위 시점에 더해 OnStartedLeading 이 반환할 때까지
+// 어느 경로로 끝나든 이 인스턴스가 리더였다면 Lease 반납을 시도한다(ReleaseOnCancel). 다음
+// 리더가 LeaseDuration 만료를 기다리지 않아 failover 가 빨라진다 - 조건은 README 함정 3.
+//
+// cfg.WaitForLeaderWork 가 true 면 위 시점에 더해, 리더 작업이 시작됐었던 경우 그 종료까지
 // 기다린 뒤 반환한다(반환값은 달라지지 않는다).
 //
 // 설정이 잘못된 경우 ErrInvalidConfig 등을 반환한다. 리더직을 잃어도 같은 프로세스에서
@@ -164,7 +166,10 @@ func Run(ctx context.Context, client kubernetes.Interface, cfg Config) error {
 	}
 
 	elector, err := k8sle.NewLeaderElector(k8sle.LeaderElectionConfig{
-		Lock:            lock,
+		Lock: lock,
+		// 이름은 "OnCancel" 이지만 client-go 는 renew 루프를 빠져나온 뒤 종료 사유를 구분하지
+		// 않고 반납을 시도한다 - 비자발적 상실에서도 돈다. failover 를 빠르게 하려고 켜되,
+		// 반납 자체는 best effort 로 본다(README 함정 3).
 		ReleaseOnCancel: true,
 		LeaseDuration:   cfg.LeaseDuration,
 		RenewDeadline:   cfg.RenewDeadline,
@@ -199,12 +204,13 @@ func Run(ctx context.Context, client kubernetes.Interface, cfg Config) error {
 	elector.Run(ctx)
 
 	// client-go 는 OnStartedLeading 을 별도 goroutine 으로 띄우고 그 종료를 기다리지
-	// 않는다. 옵션이 켜져 있으면 여기서 기다려, 호출자가 Run 반환 뒤 곧바로 재경쟁해도
-	// 이전 리더 작업과 겹치지 않게 한다.
+	// 않는다. 옵션이 켜져 있으면 여기서 기다려, 같은 프로세스가 Run 반환 뒤 곧바로
+	// 재경쟁할 때 이전 리더 작업이 다음 판까지 흐르지 않게 한다.
 	//
-	// 남는 창: acquire 직후 ctx 가 취소되면 goroutine 이 leaderWorkStarted 를 세팅하기
-	// 전에 elector.Run 이 반환할 수 있고, 그때는 기다리지 않는다. acquire 에 성공하면
-	// renew 가 최소 한 사이클은 돌기 때문에 실무에서 문제되는 창은 아니다.
+	// 남는 창: acquire 직후 상위 ctx 가 취소되면 renew 가 wait.BackoffUntil 진입부의 ctx
+	// 검사에서 곧바로 반환해, goroutine 이 leaderWorkStarted 를 세팅하기 전에 elector.Run 이
+	// 반환할 수 있다. 그 창은 상위 ctx 가 이미 죽어 RunUntilCancelled 이 다음 판을 열지
+	// 않으므로, 재경쟁 겹침이 아니라 "Run 반환 뒤 리더 작업 시작" 이라는 성격이다.
 	if cfg.WaitForLeaderWork && leaderWorkStarted.Load() {
 		<-leaderWorkDone
 	}

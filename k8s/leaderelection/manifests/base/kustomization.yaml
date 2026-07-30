@@ -1,5 +1,6 @@
 # base: 리더 선출 데모의 기본 배포(LE_MODE=exit).
-# 배포: kubectl apply -k manifests/base
+# 배포: make deploy (이미지 적재를 포함한다. imagePullPolicy 가 Never 라
+# 맨 kubectl apply -k 는 노드에 이미지가 없으면 ErrImageNeverPull 로 멈춘다)
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 resources:

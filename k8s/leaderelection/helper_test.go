@@ -1,12 +1,14 @@
 package leaderelection
 
 import (
+	"context"
 	"errors"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/kubernetes"
@@ -71,6 +73,23 @@ func awaitCount(t *testing.T, counter *atomic.Int32, want int32, timeout time.Du
 		time.Sleep(5 * time.Millisecond)
 	}
 	t.Fatalf("%s: %d 회에 도달하지 못했다 (현재 %d 회)", what, want, counter.Load())
+}
+
+// leaseHolder 는 clientset 에 기록된 Lease 의 holderIdentity 를 읽는다.
+// client-go 의 LeaderElectionRecordToLeaseSpec 은 이 필드를 항상 non-nil 포인터로 만들고
+// 반납 시 빈 문자열로 덮어쓴다. nil 검사는 그 계약이 깨졌을 때 패닉 대신 명확한 실패를
+// 얻기 위한 것이다.
+func leaseHolder(t *testing.T, client kubernetes.Interface, namespace, name string) string {
+	t.Helper()
+	lease, err := client.CoordinationV1().Leases(namespace).Get(
+		context.Background(), name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("Lease 조회 실패: %v", err)
+	}
+	if lease.Spec.HolderIdentity == nil {
+		t.Fatalf("Lease.Spec.HolderIdentity 가 nil 이다 (client-go 는 항상 non-nil 을 쓴다)")
+	}
+	return *lease.Spec.HolderIdentity
 }
 
 // awaitErr 는 Run 계열 호출의 반환을 기다려 에러를 돌려준다.

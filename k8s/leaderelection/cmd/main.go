@@ -29,6 +29,9 @@ import (
 	"github.com/daengdaengLee/snippetgo/k8s/leaderelection"
 )
 
+// -mode 검증과 아래 switch 의 default 가 같은 문구를 두 벌 갖지 않게 뽑았다.
+const unknownModeFmt = "알 수 없는 -mode=%q (exit | rejoin)"
+
 func main() {
 	kubeconfig := flag.String("kubeconfig", "", "클러스터 밖에서 실행할 때 쓸 kubeconfig 경로 (비우면 KUBECONFIG/~/.kube/config)")
 	mode := flag.String("mode", cmp.Or(os.Getenv("LE_MODE"), "exit"), "리더직 상실 처리: exit | rejoin")
@@ -37,7 +40,7 @@ func main() {
 	// 설정 오류는 클라이언트를 만들기 전에 걸러낸다. 뒤로 미루면 클러스터 밖에서
 	// 실행할 때 kubeconfig 로드 실패가 먼저 터져 진짜 원인이 가려진다.
 	if *mode != "exit" && *mode != "rejoin" {
-		log.Fatalf("알 수 없는 -mode=%q (exit | rejoin)", *mode)
+		log.Fatalf(unknownModeFmt, *mode)
 	}
 
 	// identity 는 그룹 안에서 유일해야 한다. 파드 안이면 Downward API 로 주입한
@@ -70,6 +73,10 @@ func main() {
 		Namespace: namespace,
 		LeaseName: leaseName,
 		Identity:  identity,
+		// rejoin 모드에서만 켠다. 상실 직후 재획득할 때 이전 리더 작업이 다음 판까지 흐르는
+		// 것을 줄인다(범위와 한계는 README 함정 5). runLeaderWork 가 ctx 취소를 확실히
+		// 따르므로 블록 위험이 없고, exit 모드는 상실 시 프로세스가 죽어 기다릴 이유가 없다.
+		WaitForLeaderWork: *mode == "rejoin",
 		OnStartedLeading: func(ctx context.Context) {
 			log.Printf("[%s] started leading - 여기서 싱글톤 작업을 돌린다", identity)
 			runLeaderWork(ctx, identity)
@@ -104,8 +111,10 @@ func main() {
 			log.Fatalf("[%s] 리더 선출 종료(에러): %v", identity, err)
 		}
 	default:
-		// 위에서 이미 걸렀다. 모드를 추가하면서 검증을 빠뜨리는 것을 막는 방어선이다.
-		log.Fatalf("알 수 없는 -mode=%q (exit | rejoin)", *mode)
+		// 위 -mode 검증이 유일한 관문이라 여기까지 오는 값은 없다. 이 분기가 잡아 주는 건
+		// 반대 방향이다 - 허용 목록에 모드를 추가하면서 case 를 빠뜨리면, 조용히 아무 것도
+		// 안 하고 "종료" 를 찍는 대신 여기서 멈춘다.
+		log.Fatalf(unknownModeFmt, *mode)
 	}
 	log.Printf("[%s] 종료", identity)
 }

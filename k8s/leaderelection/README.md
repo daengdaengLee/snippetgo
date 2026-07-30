@@ -55,7 +55,8 @@ Docker Desktop 이 떠 있으면 되고, 리눅스는 현재 사용자가 docker
 
 ## 빠른 시작
 
-kind + Docker 로 끝까지 한 번에 돌려본다(정리 -> 클러스터 구축 -> 이미지 빌드/적재 -> 배포):
+kind + Docker 로 끝까지 한 번에 돌려본다(정리(클러스터/로컬 이미지) -> 클러스터 구축 ->
+이미지 빌드/적재 -> 배포):
 
 ```bash
 cd k8s/leaderelection
@@ -103,7 +104,7 @@ func RunUntilCancelled(ctx context.Context, client kubernetes.Interface, cfg Con
 | `LeaseDuration` | X | `15s` | 리더가 죽은 뒤 임대를 빼앗기까지의 상한(=failover 지연) |
 | `RenewDeadline` | X | `10s` | 리더가 이 시간 안에 갱신 실패 시 스스로 리더직을 내려놓음 |
 | `RetryPeriod` | X | `2s` | 획득/갱신 재시도 간격 |
-| `WaitForLeaderWork` | X | `false` | true 면 Run 이 OnStartedLeading 종료를 기다린 뒤 반환 (함정 5) |
+| `WaitForLeaderWork` | X | `false` | true 면 (리더였다면) OnStartedLeading 종료까지 기다린 뒤 반환 - 같은 프로세스 안 겹침만 (함정 5) |
 | `OnStartedLeading` | X | nil | 리더가 됐을 때 호출. 넘어온 ctx 는 리더직 상실 시 취소됨 |
 | `OnStoppedLeading` | X | nil | Run 종료 시 항상 호출(리더가 된 적 없어도). 정리는 멱등이어야 함 (함정 7) |
 | `OnNewLeader` | X | nil | 관찰된 리더가 바뀔 때마다 호출(관측용) |
@@ -130,28 +131,35 @@ func RunUntilCancelled(ctx context.Context, client kubernetes.Interface, cfg Con
 | `RenewDeadline` | 현재 리더가 이 안에 갱신 못 하면 자진 하야 | 리더 유지 관대 | 네트워크 지연에 민감 |
 | `RetryPeriod` | 획득/갱신 시도 간격 | API 부하 적음 | 반응 빠름, 부하 큼 |
 
-`Run` 은 종료 시(`ctx` 취소) 리더였다면 **`ReleaseOnCancel` 로 Lease 를 즉시 반납**한다.
-그래서 정상 종료(파드 rolling update, SIGTERM) 에서는 다음 리더가 `LeaseDuration` 만료를
-기다리지 않고 바로 이어받는다. 반대로 리더 Pod 가 갑자기 죽으면(kill -9, 노드 장애) 반납이
-없으므로 남은 인스턴스는 `LeaseDuration` 이 지나서야 임대를 가져간다.
+정상 종료(파드 rolling update, SIGTERM) 에서는 리더가 Lease 를 반납하므로 다음 리더가
+`LeaseDuration` 만료를 기다리지 않고 바로 이어받는다. 반대로 갑자기 죽으면(kill -9, 노드 장애)
+반납이 없어 `LeaseDuration` 이 지나서야 넘어간다. 반납이 도는 조건은 함정 3 에서 다룬다.
 
 ## 직접 확인해보기
 
 | 명령 | 하는 일 |
 | --- | --- |
-| `make demo` | 기존 클러스터 정리 -> kind 생성 -> 이미지 빌드/적재 -> 배포 (`exit` 모드) |
+| `make demo` | 기존 클러스터/로컬 이미지 정리 -> kind 생성 -> 이미지 빌드/적재 -> 배포 (`exit` 모드) |
 | `make demo-rejoin` | 위와 같되 rejoin overlay 로 배포 |
-| `make deploy-rejoin` | 이미 뜬 클러스터에 rejoin overlay 만 재배포(클러스터 재생성 없음) |
+| `make deploy` | 빌드 -> 적재 -> apply -> Pod 재시작 -> 롤아웃 대기 (kind 클러스터 필수) |
+| `make deploy-rejoin` | 클러스터 재생성 없이 rejoin overlay 재배포(빌드/적재/Pod 재시작 포함) |
 | `make logs` | 모든 Pod 로그 실시간(리더 관찰) |
 | `make status` | Lease 1 개와 Pod 3 개 상태 |
 | `make leader` | 현재 리더(`Lease.holderIdentity`) 출력 |
 | `make kill-leader` | 현재 리더 Pod 삭제 -> failover 유도 |
-| `make clean` | 클러스터/바이너리 정리 |
+| `make break-renew` | Role 에서 `update` 회수 -> 비자발적 리더직 상실 유도 (함정 6) |
+| `make fix-renew` | `update` 권한 복구 |
+| `make clean` | 클러스터/로컬 이미지/바이너리 정리 |
 
 리더직 상실 처리 방식(`LE_MODE`)은 kustomize 로 고른다. base(`manifests/base`)는 `exit`,
-`manifests/overlays/rejoin` overlay 가 `rejoin` 으로 덮어쓴다. `make deploy` 는
-`kubectl apply -k $(KUSTOMIZE_DIR)`(기본 `manifests/base`) 로 배포하고, `make demo-rejoin` 은
-overlay 를 가리킨다.
+`manifests/overlays/rejoin` overlay 가 `rejoin` 으로 덮어쓴다. `make deploy` 는 빌드 -> kind
+노드 적재 -> `kubectl apply -k $(KUSTOMIZE_DIR)`(기본 `manifests/base`) -> Pod 재시작 -> 롤아웃
+대기 순으로 돈다. 클러스터가 없으면 `make demo` 부터 시작한다.
+
+`imagePullPolicy` 가 `Never` 라 노드 적재가 이미지를 넣는 유일한 경로다. 그래서 `deploy` 가
+`load` 를 전제조건으로 갖는다. 또 태그가 `:dev` 로 고정이라 `apply` 만으로는 새 이미지가
+반영되지 않으므로(spec 변화가 없어 롤아웃이 안 난다) `deploy` 가 `rollout restart` 까지 한다 -
+그래서 `make deploy` 는 매번 Pod 를 새로 띄운다.
 
 배포 후 Lease 를 보면 한 Pod 가 홀더로 잡혀 있다:
 
@@ -188,8 +196,26 @@ pod "leaderelection-6c9d4f8b7-abcde" deleted
 `ReleaseOnCancel` 덕에 정상 종료(`delete pod` 는 SIGTERM 을 보냄) 라 Lease 가 즉시 반납되어
 `LeaseDuration` 을 기다리지 않고 바로 넘어간다. 이 `kill-leader` failover 는 SIGTERM -> ctx 취소
 -> 깨끗한 종료 경로라 **exit/rejoin 두 모드에서 동일**하게 동작한다. 두 모드의 차이는 *비자발적*
-리더직 상실(리더가 API 서버와 단절돼 갱신에 실패하는 경우) 에서만 드러나는데, 이건 API 파티션을
-인위로 만들어야 해서 이 데모 스크립트로는 재현하지 않는다(함정 6 에서 설명).
+리더직 상실(리더가 갱신에 실패하는 경우) 에서만 드러난다.
+
+비자발적 상실은 API 파티션을 만들지 않고도 재현할 수 있다. renew 는 Lease `update` 이므로
+**Role 에서 `update` verb 만 회수하면 ctx 는 살아 있는 채 갱신만 실패**한다:
+
+```bash
+make break-renew    # Role 의 verbs 를 [get, create] 로 줄인다
+# exit 모드:   리더 Pod 가 RESTARTS 1 (STATUS 는 Running 유지)
+# rejoin 모드: RESTARTS 0, 같은 프로세스가 재획득을 계속 시도
+make fix-renew      # 복구
+```
+
+`break-renew` 는 Role 을 훼손된 상태로 남긴다. 복구하지 않으면 그 클러스터에서는 **어떤 Pod 도
+리더가 될 수 없다.** 복구는 `make fix-renew` 가 1순위다. `kubectl apply -k` 도 `rbac.yaml` 을
+재적용해 원복하지만, **인수 없는 `make deploy` 는 base(exit) 를 적용해 rejoin 배포를 exit 으로
+되돌린다** - rejoin 을 유지하려면 `make deploy-rejoin` 을 쓴다. 최후에는 `make demo`(클러스터/
+이미지까지 새로 만든다).
+
+주의: 훼손 중에는 반납(`release`)도 거부되므로 `make leader` 가 옛 홀더 이름을 그대로 보여준다.
+정상처럼 보이니 `RESTARTS` 와 로그로 판단해야 한다. 자세한 차이는 함정 6 에서 설명한다.
 
 ## 매니페스트 / RBAC
 
@@ -202,10 +228,12 @@ pod "leaderelection-6c9d4f8b7-abcde" deleted
   get(확인)/create(최초)/update(갱신,반납)할 뿐 list/watch/patch/delete 를 쓰지 않는다.
   `EventRecorder` 도 안 써서 `events` 권한 역시 필요 없다.
 - `base/deployment.yaml` - `replicas: 3`. Downward API 로 `POD_NAME`/`POD_NAMESPACE` 를 주입해
-  identity 로 쓴다. 이미지는 `imagePullPolicy: IfNotPresent`(kind 로 노드에 직접 적재),
-  distroless nonroot 와 맞춘 `securityContext`(비루트, 읽기 전용 루트 FS).
+  identity 로 쓴다. 이미지는 **`imagePullPolicy: Never`** - `make load` 로 kind 노드에 심은
+  이미지만 쓰고 레지스트리는 아예 조회하지 않는다. 이미지가 없으면 엉뚱한 걸 당겨오는 대신
+  `ErrImageNeverPull` 로 멈춘다. distroless nonroot 와 맞춘 `securityContext`(비루트, 읽기 전용 루트 FS).
 - `overlays/rejoin/` - `LE_MODE` 만 `rejoin` 으로 바꾸는 overlay(base 를 참조).
-  `kubectl apply -k manifests/base`(exit) / `kubectl apply -k manifests/overlays/rejoin`(rejoin).
+  배포는 `make deploy`(exit) / `make deploy-rejoin`(rejoin) 을 쓴다. `Never` 때문에 맨
+  `kubectl apply -k` 만으로는 뜨지 않으므로, 직접 apply 할 거면 `make load` 를 먼저 돌려야 한다.
 
 이미지는 로컬에서 `go build` 한 정적 바이너리를 `Dockerfile` 이 복사만 한다(빌드는 Makefile,
 런타임은 `gcr.io/distroless/static:nonroot`).
@@ -226,11 +254,17 @@ client-go `NewLeaderElector` 가 강제한다. 예를 들어 `RetryPeriod=9s, Re
 채우는 필수 필드(Namespace/LeaseName/Identity)만 확인하고, 타이밍은 중복 검사하지 않는다 -
 어긋나면 `NewLeaderElector` 의 에러가 `Run` 을 통해 그대로 나온다(단일 권위, 상수 변경에도 자동 정합).
 
-### 3. `ReleaseOnCancel` 로 빠른 failover - 구현됨
+### 3. `ReleaseOnCancel` 로 빠른 failover (취소 전용은 아니다) - 구현됨
 
 `Run` 은 `ReleaseOnCancel: true` 라, `ctx` 취소 시 리더면 Lease 를 즉시 반납한다. 이게 없으면
-정상 종료에서도 다음 리더가 `LeaseDuration` 만큼 기다린다. 단, 프로세스가 갑자기 죽으면(SIGKILL)
-반납할 새가 없어 만료를 기다리는 건 어쩔 수 없다.
+정상 종료에서도 다음 리더가 `LeaseDuration` 만큼 기다린다.
+
+이름이 "OnCancel" 이지만 **취소 전용이 아니다.** client-go 는 renew 루프를 빠져나온 뒤 종료
+사유를 구분하지 않고 반납을 시도하므로, 갱신 실패로 임대를 비자발적으로 놓친 경우에도 반납이
+돈다. 그래서 반납은 best effort 로 봐야 한다 - 프로세스가 갑자기 죽으면(SIGKILL) 반납할 새가
+없어 만료를 기다려야 하고, 반대로 일시적 API 장애가 회복된 직후라면 이미 남이 가져간 Lease 의
+홀더를 자기 판단으로 비워 버릴 수도 있다. 훼손 중에는 반납 자체가 거부된다("직접 확인해보기"
+의 `break-renew` 주의 참고).
 
 ### 4. identity 는 그룹 안에서 유일해야 한다 - cmd 에서 구현
 
@@ -248,15 +282,20 @@ API 의 `metadata.name`(Pod 이름) 을 `POD_NAME` 으로 주입해 쓴다. `cmd
 띄우고 그 종료를 기다리지 않은 채 `Run` 이 반환하므로, rejoin 모드에서 같은 Pod 가 상실 직후
 재획득하면 이전 작업 고루틴이 정리를 끝내기 전에 새 고루틴이 시작될 수 있다.
 
-`Config.WaitForLeaderWork` 로 고른다.
+`Config.WaitForLeaderWork` 를 켜면 `Run` 은 (리더 작업이 시작됐었다면) 그 종료까지 기다린 뒤
+반환한다. 켜기 전에 범위를 정확히 알아야 한다:
 
-- **기본값 `false`**: client-go 동작을 그대로 노출한다. 위 겹침이 생길 수 있다.
-- **`true`**: `Run` 이 `OnStartedLeading` 반환까지 기다린 뒤 반환하므로, `RunUntilCancelled`
-  가 다음 판을 시작할 때 이전 리더 작업은 이미 끝나 있다. 겹침이 사라진다.
+- **막아 준다**: 같은 프로세스에서 `RunUntilCancelled` 이 곧바로 시작하는 다음
+  `OnStartedLeading`. 이게 전부다.
+- **막아 주지 않는다**: Lease 반납(함정 3) 과 `OnStoppedLeading`(함정 7) 은 client-go
+  `LeaderElector.Run` 안에서 처리돼 이 대기보다 **먼저** 끝난다. 그래서 다른 Pod 는 이전 리더
+  작업이 정리를 끝내기 전에 리더가 될 수 있고, `OnStoppedLeading` 도 그 고루틴과 겹칠 수 있다.
+- **대가**: 콜백이 ctx 취소를 존중하지 않으면 `Run` 이 무한히 블록한다(그래서 기본값 `false`).
+  또 acquire 직후 상위 ctx 가 취소되면 콜백이 시작 표시를 세우기 전에 `Run` 이 반환해 대기가
+  걸리지 않는다 - 그 창은 상위 ctx 가 이미 죽어 재경쟁이 아니라 "`Run` 반환 뒤 콜백 시작" 이다.
 
-트레이드오프가 있어서 기본값을 `false` 로 뒀다. `true` 인데 콜백이 ctx 취소를 존중하지 않으면
-`Run` 이 무한히 블록한다 - 즉 이 옵션은 함정 5 의 전제(ctx 를 지킨다) 를 지켜야만 안전하다.
-또 acquire 직후 ctx 가 취소되는 아주 좁은 경우에는 대기가 걸리지 않을 수 있다.
+`cmd` 데모는 rejoin 모드에서만 켠다(`WaitForLeaderWork: *mode == "rejoin"`). `runLeaderWork` 가
+ctx 취소를 확실히 따라 블록 위험이 없고, exit 은 상실 시 프로세스가 죽어 기다릴 이유가 없다.
 
 어느 쪽을 고르든, 실전 싱글톤 작업이라면 멱등성/펜싱으로 중복 수행을 흡수해야 한다
 (함정 1 과 같은 결론이다). 이 옵션은 겹침 창을 줄여줄 뿐 상호 배제를 보장하지 않는다.
@@ -274,9 +313,27 @@ client-go `LeaderElector.Run(ctx)` 은 "ctx 취소 **또는** 리더직 상실" 
   걸려 그 Pod 의 재합류가 지연될 수 있다.
 - **rejoin** (`RunUntilCancelled`): 상실해도 **같은 프로세스가 후보로 재참여**한다. 재시작
   비용이 없지만, 이전 리더의 in-memory 상태가 남은 채 재경쟁하므로 함정 5(ctx 존중) 를 특히
-  철저히 지켜 리더 전환 시 상태를 확실히 리셋해야 한다.
+  철저히 지켜 리더 전환 시 상태를 확실히 리셋해야 한다. 데모의 rejoin 모드가
+  `WaitForLeaderWork` 를 켜고 도는 이유도 여기에 있다(그 옵션의 범위는 함정 5 참고).
 
 `-mode`(또는 `LE_MODE`) 로 고르고, `make demo` / `make demo-rejoin` 으로 각각 배포해 볼 수 있다.
+차이는 `make break-renew` 로 직접 볼 수 있다("직접 확인해보기" 참고).
+
+| | exit | rejoin |
+| --- | --- | --- |
+| `RESTARTS` | 1 (exit code 1) | 0 |
+| 프로세스 | 죽고 kubelet 이 재시작 | 그대로 살아 재획득 시도 |
+| 로그 | `리더직 상실 - 재시작에 위임한다` | `OnStoppedLeading` 직후 `Attempting to acquire leader lease` |
+
+두 가지를 덧붙인다.
+
+- `break-renew` 실험에서 exit 모드 Pod 는 **재시작 1회로 끝나고 `Running` 에 머문다.** 위
+  CrashLoopBackOff 서술의 전제는 "갱신 실패가 짧은 간격으로 **반복**되면" 인데, 이 실험은
+  `update` 를 아예 막아 재시작된 Pod 가 리더가 되지도 못하게 하므로 두 번째 크래시가 없다
+  (`acquire` 루프는 실패해도 반환하지 않는다). 즉 이 절차로는 CrashLoopBackOff 를 볼 수 없다.
+- `fix-renew` 로 복구하면 **재획득자가 이전과 같은 Pod 일 수 있다.** 훼손 중에는 반납도 거부돼
+  Lease 홀더가 옛 리더로 남아 있고, 옛 리더는 자기 identity 가 홀더라 `LeaseDuration` 만료를
+  기다리지 않고 바로 갱신할 수 있다. 팔로워가 이길 수도 있는 레이스다.
 
 ### 7. OnStoppedLeading 은 리더가 아니어도 호출된다 - 설명만
 
@@ -285,9 +342,9 @@ exits, even if it did not start leading. Users should not assume that OnStoppedL
 called after OnStartedLeading." 즉 리더가 된 적 없는 팔로워가 종료해도 이 콜백이 불린다
 (`Run` 안 defer). 따라서 **OnStoppedLeading 의 정리 로직은 멱등이어야 하고, OnStartedLeading 이
 먼저 실행됐다고 가정하면 안 된다**(예: OnStartedLeading 에서 연 핸들을 닫는다면 nil 여부를 먼저
-확인). 이 순서 보장은 래퍼로 흉내낼 수 없다 - OnStartedLeading/OnNewLeader 는 client-go 가 별도
-goroutine 으로 띄우고 OnStoppedLeading 만 메인 goroutine defer 라, "리더였는지" 를 race 없이
-알려주는 동기 신호가 없기 때문이다. 그래서 이 스니펫은 client-go 계약을 그대로 노출한다.
+확인). 이 순서 보장은 래퍼가 대신 만들어 줄 수 없다 - OnStartedLeading/OnNewLeader 는 client-go
+가 별도 goroutine 으로 띄우고 OnStoppedLeading 만 메인 goroutine defer 라, "리더였는지" 를 race
+없이 알려주는 동기 신호가 없기 때문이다. 그래서 이 스니펫은 client-go 계약을 그대로 노출한다.
 
 ## 참고 자료
 

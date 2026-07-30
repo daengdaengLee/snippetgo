@@ -80,7 +80,7 @@ func TestRunRejectsBadTiming(t *testing.T) {
 		LeaseDuration: 1 * time.Second, // LeaseDuration <= RenewDeadline -> NewLeaderElector 에러
 		RenewDeadline: 2 * time.Second,
 	}
-	err := Run(context.Background(), fake.NewSimpleClientset(), cfg)
+	err := Run(context.Background(), fake.NewClientset(), cfg)
 	if err == nil {
 		t.Fatal("잘못된 타이밍인데 에러가 없다")
 	}
@@ -97,10 +97,10 @@ func TestRunReturnsOnCancelledContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // 시작 전에 취소
 
-	if err := Run(ctx, fake.NewSimpleClientset(), cfg); err != nil {
+	if err := Run(ctx, fake.NewClientset(), cfg); err != nil {
 		t.Errorf("Run = %v, want nil", err)
 	}
-	if err := RunUntilCancelled(ctx, fake.NewSimpleClientset(), cfg); err != nil {
+	if err := RunUntilCancelled(ctx, fake.NewClientset(), cfg); err != nil {
 		t.Errorf("RunUntilCancelled = %v, want nil", err)
 	}
 }
@@ -108,7 +108,7 @@ func TestRunReturnsOnCancelledContext(t *testing.T) {
 // 설정 오류는 ErrLostLease 가 아니므로 RunUntilCancelled 이 재시도하지 않고 그대로 반환해야 한다.
 func TestRunUntilCancelledDoesNotRetryConfigError(t *testing.T) {
 	cfg := Config{LeaseName: "lease", Identity: "pod-a"} // Namespace 누락
-	err := RunUntilCancelled(context.Background(), fake.NewSimpleClientset(), cfg)
+	err := RunUntilCancelled(context.Background(), fake.NewClientset(), cfg)
 	if !errors.Is(err, ErrInvalidConfig) {
 		t.Errorf("RunUntilCancelled = %v, want ErrInvalidConfig", err)
 	}
@@ -130,7 +130,7 @@ func TestOnStoppedLeadingAlwaysCalledOnExit(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // acquire 진입 전 종료 -> 리더가 되지 못함
 
-	if err := Run(ctx, fake.NewSimpleClientset(), cfg); err != nil {
+	if err := Run(ctx, fake.NewClientset(), cfg); err != nil {
 		t.Fatalf("Run = %v, want nil", err)
 	}
 	if got := started.Load(); got != 0 {
@@ -168,6 +168,45 @@ func TestRunAcquiresLeadership(t *testing.T) {
 	}
 	if got := started.Load(); got != 1 {
 		t.Errorf("OnStartedLeading 호출 %d 회, want 1", got)
+	}
+}
+
+// 함정 3: ReleaseOnCancel 로 ctx 취소 시 Lease 를 즉시 반납한다. 반납되면 client-go 가
+// holderIdentity 를 빈 문자열로 덮어쓰므로, 다음 후보가 LeaseDuration 만료를 기다리지 않고
+// 바로 이어받는다(failover 가 LeaseDuration 이 아니라 수백 ms 로 끝나는 이유).
+//
+// 여기서는 newRenewBlocker 가 아니라 fake clientset 을 직접 쓴다 - 갱신을 막을 필요가 없고,
+// Run 과 조회가 같은 인스턴스를 쓴다는 게 지역변수 하나로 자명해진다.
+func TestRunReleasesLeaseOnCancel(t *testing.T) {
+	client := fake.NewClientset()
+
+	var started atomic.Int32
+	cfg := fastConfig()
+	cfg.OnStartedLeading = func(ctx context.Context) {
+		started.Add(1)
+		<-ctx.Done()
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- Run(ctx, client, cfg) }()
+
+	awaitCount(t, &started, 1, 5*time.Second, "OnStartedLeading")
+	if got := leaseHolder(t, client, cfg.Namespace, cfg.LeaseName); got != cfg.Identity {
+		t.Fatalf("취소 전 holderIdentity = %q, want %q", got, cfg.Identity)
+	}
+
+	cancel()
+	if err := awaitErr(t, errCh, 5*time.Second, "Run"); err != nil {
+		t.Fatalf("Run = %v, want nil", err)
+	}
+
+	// client-go 는 반납을 renew 끝에서 처리하고 그 뒤에 elector.Run 이 반환하므로,
+	// Run 이 돌아온 시점에는 반납이 이미 반영돼 있다.
+	if got := leaseHolder(t, client, cfg.Namespace, cfg.LeaseName); got != "" {
+		t.Errorf("취소 후 holderIdentity = %q, want 빈 문자열 (ReleaseOnCancel 이 반납해야 한다)", got)
 	}
 }
 
@@ -225,8 +264,10 @@ func TestRunUntilCancelledRejoinsAfterLostLease(t *testing.T) {
 	}
 }
 
-// WaitForLeaderWork 를 켜면 Run 이 OnStartedLeading 종료를 기다리므로, rejoin 으로
-// 재획득해도 이전 리더 작업과 새 리더 작업이 겹치지 않는다.
+// WaitForLeaderWork 를 켜면 Run 이 리더 작업 종료를 기다리므로, rejoin 으로 재획득해도
+// 같은 프로세스 안에서 연달아 실행되는 두 OnStartedLeading 의 동시 실행이 1 을 넘지 않는다.
+// 이 테스트가 고정하는 건 그 인프로세스 겹침 하나뿐이다 - 다른 프로세스와의 겹침이나
+// OnStoppedLeading 과의 겹침은 이 옵션이 막아 주지 않는다(README 함정 5).
 //
 // 반대 방향(기본값 false 에서 겹침이 "발생함") 은 단언하지 않는다 - 재획득 속도에 따라
 // 겹치지 않을 수도 있는 타이밍 의존 현상이라 flaky 한 테스트가 된다.
@@ -240,8 +281,8 @@ func TestRunUntilCancelledWaitForLeaderWorkPreventsOverlap(t *testing.T) {
 		started.Add(1)
 		cur := concurrent.Add(1)
 		for {
-			max := maxConcurrent.Load()
-			if cur <= max || maxConcurrent.CompareAndSwap(max, cur) {
+			observed := maxConcurrent.Load()
+			if cur <= observed || maxConcurrent.CompareAndSwap(observed, cur) {
 				break
 			}
 		}
@@ -266,7 +307,7 @@ func TestRunUntilCancelledWaitForLeaderWorkPreventsOverlap(t *testing.T) {
 	awaitCount(t, &started, 2, 15*time.Second, "재경쟁 후 OnStartedLeading")
 
 	if got := maxConcurrent.Load(); got != 1 {
-		t.Errorf("최대 동시 실행 = %d, want 1 (WaitForLeaderWork 가 겹침을 막아야 한다)", got)
+		t.Errorf("최대 동시 실행 = %d, want 1 (WaitForLeaderWork 가 같은 프로세스 안 겹침을 막아야 한다)", got)
 	}
 
 	cancel()
