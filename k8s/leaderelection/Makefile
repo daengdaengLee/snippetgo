@@ -12,13 +12,12 @@ KUBECTL := kubectl --context kind-$(CLUSTER)
 # 배포할 kustomize 디렉터리. base 는 exit, overlays/rejoin 은 rejoin 모드.
 KUSTOMIZE_DIR ?= manifests/base
 # 아래 세 값은 manifests/ 의 값을 미러링하는 상수다(매니페스트가 source of truth).
-# knob 이 아니라는 뜻으로 := 를 쓰지만, := 가 막는 건 환경변수 상속뿐이다 - 커맨드라인
-# 변수(make IMAGE=... load) 는 override 없이는 못 막으니 안 바꾸는 게 규칙이다. 특히
-# IMAGE 를 오버라이드하면 빌드/적재 태그만 바뀌고 배포 매니페스트는 그대로라 롤아웃이
-# 90s 타임아웃으로 실패한다(ErrImageNeverPull).
-NAMESPACE  := snippetgo-leaderelection
-LEASE_NAME := snippetgo-leaderelection
-IMAGE      := snippetgo/leaderelection:dev
+# knob 이 아니므로 override 로 커맨드라인 변수까지 막는다 - := 만으로는 환경변수 상속만
+# 막히고 make IMAGE=... load 는 그대로 먹는다. 특히 IMAGE 가 바뀌면 빌드/적재 태그만
+# 바뀌고 배포 매니페스트는 그대로라 롤아웃이 90s 타임아웃으로 실패한다(ErrImageNeverPull).
+override NAMESPACE  := snippetgo-leaderelection
+override LEASE_NAME := snippetgo-leaderelection
+override IMAGE      := snippetgo/leaderelection:dev
 # 바이너리는 kind 노드(리눅스) 에서 돌므로 GOOS 는 linux 로 고정하고
 # GOARCH 는 호스트에 맞춰 kind 노드 아키텍처와 일치시킨다.
 GOARCH ?= $(shell go env GOARCH)
@@ -84,6 +83,8 @@ logs: ## 모든 Pod 로그를 실시간으로 따라가기(리더 관찰)
 leader: ## 현재 리더(Lease holderIdentity) 출력
 	$(KUBECTL) -n $(NAMESPACE) get lease $(LEASE_NAME) -o jsonpath='{.spec.holderIdentity}{"\n"}'
 
+# identity == Pod 이름(Downward API metadata.name) 이라는 전제에 의존한다.
+# cmd/main.go 의 identity 규칙을 바꾸면 이 타깃도 같이 고쳐야 한다.
 .PHONY: kill-leader
 kill-leader: ## 현재 리더 Pod 를 삭제해 failover 유도
 	@leader=$$($(KUBECTL) -n $(NAMESPACE) get lease $(LEASE_NAME) -o jsonpath='{.spec.holderIdentity}'); \
