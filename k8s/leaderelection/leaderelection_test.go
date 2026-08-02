@@ -171,6 +171,41 @@ func TestRunAcquiresLeadership(t *testing.T) {
 	}
 }
 
+// OnNewLeader 는 관찰된 리더가 바뀔 때마다 불린다 - 자기 자신이 리더가 된 경우도 포함이라
+// 참가자가 하나여도 확인할 수 있다. 세 콜백 중 이것만 pass-through 검증이 없었다.
+func TestOnNewLeaderReceivesLeaderIdentity(t *testing.T) {
+	// 버퍼 1 + non-blocking send: 콜백이 client-go 선출 루프를 붙잡지 않게 한다.
+	seen := make(chan string, 1)
+	cfg := fastConfig()
+	cfg.OnStartedLeading = func(ctx context.Context) { <-ctx.Done() }
+	cfg.OnNewLeader = func(identity string) {
+		select {
+		case seen <- identity:
+		default:
+		}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- Run(ctx, fake.NewClientset(), cfg) }()
+
+	select {
+	case got := <-seen:
+		if got != cfg.Identity {
+			t.Errorf("OnNewLeader(%q), want %q", got, cfg.Identity)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("OnNewLeader 가 호출되지 않았다")
+	}
+
+	cancel()
+	if err := awaitErr(t, errCh, 5*time.Second, "Run"); err != nil {
+		t.Errorf("Run = %v, want nil", err)
+	}
+}
+
 // 함정 3: ReleaseOnCancel 로 ctx 취소 시 Lease 를 즉시 반납한다. 반납되면 client-go 가
 // holderIdentity 를 빈 문자열로 덮어쓰므로, 다음 후보가 LeaseDuration 만료를 기다리지 않고
 // 바로 이어받는다(failover 가 LeaseDuration 이 아니라 수백 ms 로 끝나는 이유).
@@ -233,17 +268,39 @@ func TestRunReturnsErrLostLeaseOnRenewFailure(t *testing.T) {
 	}
 }
 
+// ctx 가 "취소" 가 아닌 사유로 끝나면 nil(정상 종료) 이 아니라 그 ctx 에러를 그대로 알린다.
+// 둘을 뭉뚱그리면 데드라인 설정 실수가 조용히 정상 종료로 묻힌다.
+func TestRunReturnsContextErrorOnDeadline(t *testing.T) {
+	cfg := fastConfig()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if err := Run(ctx, fake.NewClientset(), cfg); !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("Run = %v, want context.DeadlineExceeded", err)
+	}
+
+	// RunUntilCancelled 도 ErrLostLease 가 아닌 에러는 재시도하지 않고 그대로 돌려준다.
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel2()
+	if err := RunUntilCancelled(ctx2, fake.NewClientset(), cfg); !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("RunUntilCancelled = %v, want context.DeadlineExceeded", err)
+	}
+}
+
 // RunUntilCancelled 의 핵심 계약: 리더직을 잃어도 같은 프로세스가 다시 후보로 참여해
 // 재획득한다(OnStartedLeading 이 두 번째로 불린다).
 func TestRunUntilCancelledRejoinsAfterLostLease(t *testing.T) {
 	blocker := newRenewBlocker()
 
-	var started atomic.Int32
+	var started, stopped atomic.Int32
 	cfg := fastConfig()
 	cfg.OnStartedLeading = func(ctx context.Context) {
 		started.Add(1)
 		<-ctx.Done()
 	}
+	// 상실 확정을 붙잡는 신호. client-go 는 이 콜백을 LeaderElector.Run 의 defer 로
+	// 부르므로, 불렸다는 건 renew 가 이미 포기했다는 뜻이다.
+	cfg.OnStoppedLeading = func() { stopped.Add(1) }
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -252,9 +309,11 @@ func TestRunUntilCancelledRejoinsAfterLostLease(t *testing.T) {
 	go func() { errCh <- RunUntilCancelled(ctx, blocker.client, cfg) }()
 
 	awaitCount(t, &started, 1, 5*time.Second, "최초 OnStartedLeading")
-	blocker.Block()                    // 상실 유도
-	time.Sleep(600 * time.Millisecond) // 상실이 확정될 시간
-	blocker.Unblock()                  // 재획득 허용
+	blocker.Block() // 상실 유도
+	// sleep 으로 "이쯤이면 됐겠지" 하고 넘기면 느린 머신에서 아직 리더인 채로 Unblock 해
+	// 재획득이 일어나지 않는다. 상실이 확정된 시점을 신호로 기다린다.
+	awaitCount(t, &stopped, 1, 5*time.Second, "OnStoppedLeading(상실 확정)")
+	blocker.Unblock() // 재획득 허용
 
 	awaitCount(t, &started, 2, 10*time.Second, "재경쟁 후 OnStartedLeading")
 
@@ -274,7 +333,7 @@ func TestRunUntilCancelledRejoinsAfterLostLease(t *testing.T) {
 func TestRunUntilCancelledWaitForLeaderWorkPreventsOverlap(t *testing.T) {
 	blocker := newRenewBlocker()
 
-	var started, concurrent, maxConcurrent atomic.Int32
+	var started, stopped, concurrent, maxConcurrent atomic.Int32
 	cfg := fastConfig()
 	cfg.WaitForLeaderWork = true
 	cfg.OnStartedLeading = func(ctx context.Context) {
@@ -289,9 +348,13 @@ func TestRunUntilCancelledWaitForLeaderWorkPreventsOverlap(t *testing.T) {
 		<-ctx.Done()
 		// 리더 작업이 정리에 시간을 쓰는 현실적인 상황. 대기가 없으면 이 사이에
 		// 다음 리더 작업이 시작돼 동시 실행이 2 가 된다.
+		//
+		// 이 sleep 은 판정을 흔들지 않는다 - 느린 머신에서는 겹침 창이 넓어지므로
+		// 거짓 통과가 아니라 거짓 실패 방향이다(깨진 구현이 더 잘 잡힌다).
 		time.Sleep(400 * time.Millisecond)
 		concurrent.Add(-1)
 	}
+	cfg.OnStoppedLeading = func() { stopped.Add(1) }
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -301,7 +364,10 @@ func TestRunUntilCancelledWaitForLeaderWorkPreventsOverlap(t *testing.T) {
 
 	awaitCount(t, &started, 1, 5*time.Second, "최초 OnStartedLeading")
 	blocker.Block()
-	time.Sleep(600 * time.Millisecond)
+	// 위 테스트와 같은 이유로 sleep 대신 상실 확정 신호를 기다린다. 여기서는 대기가
+	// 끝나야(= Run 이 반환해야) 다음 판이 열리므로, 일찍 Unblock 해도 겹침 판정이
+	// 흐려지지 않는다 - 오히려 재획득을 앞당겨 깨진 구현을 더 잘 잡는다.
+	awaitCount(t, &stopped, 1, 5*time.Second, "OnStoppedLeading(상실 확정)")
 	blocker.Unblock()
 
 	awaitCount(t, &started, 2, 15*time.Second, "재경쟁 후 OnStartedLeading")
