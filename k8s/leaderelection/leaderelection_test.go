@@ -174,7 +174,10 @@ func TestRunAcquiresLeadership(t *testing.T) {
 // OnNewLeader 는 관찰된 리더가 바뀔 때마다 불린다 - 자기 자신이 리더가 된 경우도 포함이라
 // 참가자가 하나여도 확인할 수 있다. 세 콜백 중 이것만 pass-through 검증이 없었다.
 func TestOnNewLeaderReceivesLeaderIdentity(t *testing.T) {
-	// 버퍼 1 + non-blocking send: 콜백이 client-go 선출 루프를 붙잡지 않게 한다.
+	// 버퍼 1 + non-blocking send. client-go 는 OnNewLeader 를 별도 goroutine 으로 띄우므로
+	// (maybeReportTransition 의 go 호출) 콜백이 블록해도 선출 루프는 멈추지 않는다. 여기서
+	// 막으려는 건 테스트가 값을 하나 받고 끝난 뒤 두 번째 송신이 영영 블록해 goroutine 이
+	// 남는 것이다.
 	seen := make(chan string, 1)
 	cfg := fastConfig()
 	cfg.OnStartedLeading = func(ctx context.Context) { <-ctx.Done() }
@@ -340,7 +343,6 @@ func TestRunUntilCancelledWaitForLeaderWorkPreventsOverlap(t *testing.T) {
 	cfg := fastConfig()
 	cfg.WaitForLeaderWork = true
 	cfg.OnStartedLeading = func(ctx context.Context) {
-		started.Add(1)
 		cur := concurrent.Add(1)
 		for {
 			observed := maxConcurrent.Load()
@@ -348,6 +350,10 @@ func TestRunUntilCancelledWaitForLeaderWorkPreventsOverlap(t *testing.T) {
 				break
 			}
 		}
+		// started 는 겹침 기록이 끝난 뒤에 올린다. 메인 goroutine 이 started >= 2 를 게이트로
+		// maxConcurrent 를 읽으므로, 순서가 반대면 두 번째 콜백이 started 만 올리고 아직 CAS 를
+		// 못 한 창에서 읽혀 깨진 구현이 maxConcurrent == 1 로 조용히 통과할 수 있다.
+		started.Add(1)
 		<-ctx.Done()
 		// 리더 작업이 정리에 시간을 쓰는 현실적인 상황. 대기가 없으면 이 사이에
 		// 다음 리더 작업이 시작돼 동시 실행이 2 가 된다.
