@@ -149,7 +149,8 @@ func (c Config) validate() error {
 // 리더가 LeaseDuration 만료를 기다리지 않아 failover 가 빨라진다 - 조건은 README 함정 3.
 //
 // cfg.WaitForLeaderWork 가 true 면 위 시점에 더해, 리더 작업이 시작됐었던 경우 그 종료까지
-// 기다린 뒤 반환한다(반환값은 달라지지 않는다).
+// 기다린 뒤 반환한다(반환값은 대기 전에 확정되므로, 기다리는 동안 ctx 가 취소돼도 비자발적
+// 상실은 그대로 ErrLostLease 로 보고된다).
 //
 // 설정이 잘못된 경우 ErrInvalidConfig 등을 반환한다. 리더직을 잃어도 같은 프로세스에서
 // 계속 재경쟁하려면 RunUntilCancelled 를 쓴다.
@@ -216,11 +217,20 @@ func Run(ctx context.Context, client kubernetes.Interface, cfg Config) error {
 	// 자체적으로 에러를 돌려주지 않으므로 종료 원인은 ctx 상태로 구분한다.
 	elector.Run(ctx)
 
+	// 종료 사유는 반드시 여기서 - 아래 대기보다 먼저 - 확정한다. WaitForLeaderWork 대기는
+	// 리더 작업이 정리에 쓰는 시간만큼 길어질 수 있고, 그 사이 상위 ctx 가 취소되면
+	// ctx.Err() 이 non-nil 로 바뀌어 비자발적 상실이 정상 종료(nil)로 둔갑한다.
+	//
+	// 이 순서를 결정적으로 검증하는 테스트는 없다 - 캡처와 취소 사이에 관측 가능한
+	// happens-before 엣지가 없어(래퍼가 내부 상태를 노출하지 않는다) 테스트가 타이밍 마진에
+	// 의존하게 된다. 그래서 코드 배치로만 보장한다. 이 줄을 대기 아래로 옮기지 말 것.
+	exitErr := ctx.Err()
+
 	// client-go 는 OnStartedLeading 을 별도 goroutine 으로 띄우고 그 종료를 기다리지
 	// 않는다. 옵션이 켜져 있으면 여기서 기다려, 같은 프로세스가 Run 반환 뒤 곧바로
 	// 재경쟁할 때 이전 리더 작업이 다음 판까지 흐르지 않게 한다.
 	//
-	// ctx 가 살아 있다는 건 acquire 가 성공했었다는 뜻이다 - client-go 의 acquire 는 상위 ctx
+	// exitErr == nil 은 acquire 가 성공했었다는 뜻이다 - client-go 의 acquire 는 상위 ctx
 	// 가 죽어야만 false 를 반환하기 때문이다. 그러면 OnStartedLeading goroutine 도 이미 떴으니
 	// leaderWorkDone 은 반드시 닫힌다. 즉 이 옵션이 존재하는 이유인 상실 -> 재경쟁 경로는
 	// 플래그를 보지 않아도 대기가 보장된다.
@@ -230,17 +240,17 @@ func Run(ctx context.Context, client kubernetes.Interface, cfg Config) error {
 	// 플래그를 세우기 전에 elector.Run 이 반환할 수 있다. 그 창은 상위 ctx 가 이미 죽어
 	// RunUntilCancelled 이 다음 판을 열지 않으므로, 재경쟁 겹침이 아니라 "Run 반환 뒤 리더
 	// 작업 시작" 이라는 성격이다.
-	if cfg.WaitForLeaderWork && (ctx.Err() == nil || leaderWorkStarted.Load()) {
+	if cfg.WaitForLeaderWork && (exitErr == nil || leaderWorkStarted.Load()) {
 		<-leaderWorkDone
 	}
 
-	if err := ctx.Err(); err != nil {
-		if errors.Is(err, context.Canceled) {
-			return nil // SIGTERM 등 정상 취소
-		}
-		return err // 데드라인 만료 등은 그대로 알린다
+	if exitErr == nil {
+		return ErrLostLease // ctx 는 살아 있는데 반환됨 = 비자발적 리더직 상실
 	}
-	return ErrLostLease // ctx 는 살아 있는데 반환됨 = 비자발적 리더직 상실
+	if errors.Is(exitErr, context.Canceled) {
+		return nil // SIGTERM 등 정상 취소
+	}
+	return exitErr // 데드라인 만료 등은 그대로 알린다
 }
 
 // RunUntilCancelled 는 ctx 가 취소될 때까지 리더 선출에 계속 참여한다.
@@ -262,8 +272,12 @@ func RunUntilCancelled(ctx context.Context, client kubernetes.Interface, cfg Con
 		if !errors.Is(err, ErrLostLease) {
 			return err // 설정 오류 등은 재시도하지 않는다
 		}
-		if ctx.Err() != nil {
-			return nil // 상실과 취소가 겹친 경우도 정상 종료로 본다
+		// 상실과 ctx 종료가 겹친 경우. Run 과 같은 규칙으로 사유를 구분한다.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			if errors.Is(ctxErr, context.Canceled) {
+				return nil // 정상 취소
+			}
+			return ctxErr // 데드라인 만료 등은 그대로 알린다
 		}
 		// 리더직만 잃고 ctx 는 살아 있음 -> 루프가 다시 Run 을 돌려 재경쟁(acquire)한다.
 	}

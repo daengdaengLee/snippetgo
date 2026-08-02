@@ -118,6 +118,9 @@ func RunUntilCancelled(ctx context.Context, client kubernetes.Interface, cfg Con
 | `ErrInvalidConfig` | `Namespace`/`LeaseName`/`Identity` 중 하나라도 비었을 때 |
 | 그 외 에러 | 타이밍 관계식 위반, 클라이언트 생성 실패 등 |
 
+반환값은 client-go 선출 루프가 반환한 시점에 확정된다. 그래서 `WaitForLeaderWork` 대기가
+길어지는 동안 `ctx` 가 취소돼도 비자발적 상실은 `nil` 이 아니라 `ErrLostLease` 로 그대로 나온다.
+
 ## 동작 방식
 
 리더 선출의 핵심은 세 타이밍 값의 관계다. `RenewDeadline < LeaseDuration` 이어야 하고,
@@ -301,6 +304,9 @@ API 의 `metadata.name`(Pod 이름) 을 `POD_NAME` 으로 주입해 쓴다. `cmd
   죽어야만 실패하므로, `Run` 이 돌아온 시점에 ctx 가 살아 있다면 리더 작업 goroutine 은 반드시
   떠 있고 대기도 반드시 걸린다. 즉 이 옵션이 필요한 **상실 -> 재경쟁 경로에서는 보장**이고,
   건너뛰는 쪽은 어차피 다음 판이 없어 겹칠 것도 없는 경우다.
+- **반환값은 흔들리지 않는다**: 종료 사유는 client-go 선출 루프가 반환한 시점에 확정하고,
+  대기는 그다음이다. 그래서 기다리는 동안 상위 ctx 가 취소돼도 비자발적 상실은 정상 종료
+  (`nil`) 로 둔갑하지 않고 `ErrLostLease` 로 남는다.
 
 `cmd` 데모는 rejoin 모드에서만 켠다(`WaitForLeaderWork: *mode == "rejoin"`). `runLeaderWork` 가
 ctx 취소를 확실히 따라 블록 위험이 없고, exit 은 상실 시 프로세스가 죽어 기다릴 이유가 없다.
@@ -410,6 +416,12 @@ LeaseDuration` 을 지키는 선에서 최대한 줄인 값이다(함정 2).
 (`ReleaseOnCancel` 반납)은 취소 후 `holderIdentity` 가 빈 문자열이 되는지로 확인한다. 타이밍
 관계식 검증을 client-go 에 위임한 것(함정 2)도 `Run` 이 `NewLeaderElector` 의 에러를 그대로
 돌려주는지로 고정한다.
+
+**테스트로 고정하지 않는 것 하나.** `Run` 이 종료 사유를 `WaitForLeaderWork` 대기 **전에**
+확정한다는 순서는 테스트가 없다. 사유를 캡처하는 시점과 상위 ctx 취소 사이에 관측 가능한
+happens-before 엣지가 없어서(래퍼가 내부 상태를 노출하지 않는다) 어떤 테스트를 짜도 결국
+타이밍 마진에 기대게 되고, 그 마진이 어긋나면 **거짓 실패** 방향으로 깨진다. 그래서 이 순서는
+코드 배치와 그 자리의 주석으로만 보장한다.
 
 ## 참고 자료
 
