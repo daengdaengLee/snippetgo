@@ -93,11 +93,18 @@ kill-leader: ## 현재 리더 Pod 를 삭제해 failover 유도
 	$(KUBECTL) -n $(NAMESPACE) delete pod "$$leader"
 
 # renew 는 Lease update 이므로 update 만 막으면 ctx 는 살아 있는 채 갱신만 실패한다
-# = API 파티션 없이 비자발적 상실을 재현. rules 는 하나뿐이라 인덱스 0 을 쓴다.
+# = API 파티션 없이 비자발적 상실을 재현.
+#
+# update 를 가진 규칙은 rules[0] 이다(rules[1] 은 create 전용). JSON Patch 는 인덱스로만
+# 짚을 수 있어, rbac.yaml 의 규칙 순서가 바뀌면 엉뚱한 규칙을 조용히 훼손할 수 있다.
+# 앞의 test op 가 그 침묵 실패를 소리나는 실패로 바꾼다 - patch 는 원자적이라 test 가
+# 어긋나면 replace 도 적용되지 않는다. 대가는 두 번 부르면 실패한다는 것이고, 그 경우도
+# 아래 안내가 원인을 짚어 준다.
 .PHONY: break-renew
 break-renew: ## Role 에서 update 권한을 회수해 비자발적 리더직 상실 유도
-	$(KUBECTL) -n $(NAMESPACE) patch role leaderelection --type=json \
-		-p='[{"op":"replace","path":"/rules/0/verbs","value":["get","create"]}]'
+	@$(KUBECTL) -n $(NAMESPACE) patch role leaderelection --type=json \
+		-p='[{"op":"test","path":"/rules/0/verbs","value":["get","update"]},{"op":"replace","path":"/rules/0/verbs","value":["get"]}]' \
+		|| { echo "patch 실패: 이미 훼손됐거나(-> make fix-renew) rbac.yaml 의 규칙 순서가 바뀌었다"; exit 1; }
 	@echo "Role 이 훼손된 상태다. 복구: make fix-renew (Deployment 를 건드리지 않아 exit/rejoin 모드는 유지된다)"
 
 # 매니페스트가 source of truth 다. verb 목록을 여기에 다시 적으면 rbac.yaml 이 바뀔 때

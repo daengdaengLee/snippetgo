@@ -46,6 +46,8 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
+            # rbac.yaml Role 의 resourceNames 와 반드시 같아야 한다 - 어긋나면
+            # Lease get/update 가 Forbidden 이라 아무도 리더가 되지 못한다.
             - name: LEASE_NAME
               value: snippetgo-leaderelection
             # 리더직 상실 처리 방식(exit | rejoin). base 는 exit 이고,

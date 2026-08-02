@@ -209,7 +209,7 @@ pod "leaderelection-6c9d4f8b7-abcde" deleted
 **Role 에서 `update` verb 만 회수하면 ctx 는 살아 있는 채 갱신만 실패**한다:
 
 ```bash
-make break-renew    # Role 의 verbs 를 [get, create] 로 줄인다
+make break-renew    # Role rules[0] 의 verbs 를 [get] 으로 줄인다(update 회수)
 # exit 모드:   리더 Pod 가 RESTARTS 1 (STATUS 는 Running 유지)
 # rejoin 모드: RESTARTS 0, 같은 프로세스가 재획득을 계속 시도
 make fix-renew      # 복구
@@ -233,6 +233,11 @@ make fix-renew      # 복구
   `leases` 에 대해 `get,create,update` 만** 준다. `resourcelock.LeaseLock` 은 단일 Lease 를
   get(확인)/create(최초)/update(갱신,반납)할 뿐 list/watch/patch/delete 를 쓰지 않는다.
   `EventRecorder` 도 안 써서 `events` 권한 역시 필요 없다.
+  최소 권한은 verb 와 resource **두 축**이라, `get,update` 는 `resourceNames` 로 Lease 이름
+  하나까지 좁혔다. 규칙이 둘로 나뉜 이유는 **`create` 를 `resourceNames` 로 좁힐 수 없기**
+  때문이다 - 생성 시점엔 그 이름의 오브젝트가 아직 없어서 매칭할 대상이 없다. 대신
+  `resourceNames` 는 `deployment.yaml` 의 `LEASE_NAME` 과 **반드시 같아야 한다**. 어긋나면
+  Lease get/update 가 Forbidden 이라 아무도 리더가 되지 못하니 양쪽에 주석을 달아 뒀다.
 - `base/deployment.yaml` - `replicas: 3`. Downward API 로 `POD_NAME`/`POD_NAMESPACE` 를 주입해
   identity 로 쓴다. 이미지는 **`imagePullPolicy: Never`** - `make load` 로 kind 노드에 심은
   이미지만 쓰고 레지스트리는 아예 조회하지 않는다. 이미지가 없으면 엉뚱한 걸 당겨오는 대신
