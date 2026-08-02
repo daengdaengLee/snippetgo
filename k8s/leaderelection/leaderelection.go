@@ -19,6 +19,7 @@ package leaderelection
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync/atomic"
 	"time"
 
@@ -43,8 +44,9 @@ const (
 )
 
 // ErrInvalidConfig 는 Namespace 나 LeaseName, Identity 처럼 기본값을 정할 수 없는
-// 필수 값이 비어 있을 때 Run 이 반환한다.
-var ErrInvalidConfig = errors.New("leaderelection: Namespace, LeaseName, Identity 는 필수다")
+// 필수 값이 비어 있을 때 Run 이 반환한다. 어느 필드가 비었는지는 감싼 메시지로 알린다
+// (errors.Is 로는 그대로 잡힌다).
+var ErrInvalidConfig = errors.New("leaderelection: 필수 설정이 비었다")
 
 // ErrLostLease 는 이 인스턴스가 리더였다가 갱신(renew) 에 실패해 리더직을 비자발적으로
 // 상실했을 때 Run 이 반환한다. ctx 취소로 인한 정상 종료(nil 반환) 와 구분하기 위한 신호다.
@@ -71,11 +73,15 @@ type Config struct {
 	RenewDeadline time.Duration
 	RetryPeriod   time.Duration
 
-	// WaitForLeaderWork 가 true 면, 리더 작업(OnStartedLeading) 이 시작됐었던 경우에 한해
-	// Run 은 그 종료까지 기다린 뒤 반환한다. 이 대기가 막아 주는 겹침은 하나뿐이다 - 같은
-	// 프로세스에서 RunUntilCancelled 이 곧바로 시작하는 다음 OnStartedLeading. Lease 반납과
-	// OnStoppedLeading 은 client-go 안에서 이 대기보다 먼저 끝나므로 다른 프로세스와의
-	// 겹침은 그대로 남는다(범위와 대가는 README 함정 5).
+	// WaitForLeaderWork 가 true 면, 리더 작업(OnStartedLeading) 이 시작된 경우 Run 은 그
+	// 종료까지 기다린 뒤 반환한다. 리더가 된 적 없으면 기다리지 않고, 리더직 상실로 끝난
+	// 경우(ctx 는 살아 있다) 에는 대기가 보장된다 - 건너뛰는 경로는 ctx 가 이미 죽어 다음
+	// 판 자체가 없는 경우뿐이다.
+	//
+	// 이 대기가 막아 주는 겹침은 하나뿐이다 - 같은 프로세스에서 RunUntilCancelled 이 곧바로
+	// 시작하는 다음 OnStartedLeading. Lease 반납과 OnStoppedLeading 은 client-go 안에서 이
+	// 대기보다 먼저 끝나므로 다른 프로세스와의 겹침은 그대로 남는다(범위와 대가는 README
+	// 함정 5).
 	//
 	// 기본값 false 는 client-go 동작(콜백을 별도 goroutine 으로 띄우고 기다리지 않음) 을
 	// 그대로 노출한다. true 로 켜면 콜백이 넘어온 ctx 취소를 존중하지 않을 때 Run 이 무한히
@@ -119,8 +125,13 @@ func (c Config) applyDefaults() Config {
 // client-go NewLeaderElector 가 최종 권위이므로 여기서 중복 검사하지 않는다. 어긋나면
 // Run 안의 NewLeaderElector 가 에러를 내고 Run 이 그대로 반환한다.
 func (c Config) validate() error {
-	if c.Namespace == "" || c.LeaseName == "" || c.Identity == "" {
-		return ErrInvalidConfig
+	switch {
+	case c.Namespace == "":
+		return fmt.Errorf("%w: Namespace", ErrInvalidConfig)
+	case c.LeaseName == "":
+		return fmt.Errorf("%w: LeaseName", ErrInvalidConfig)
+	case c.Identity == "":
+		return fmt.Errorf("%w: Identity", ErrInvalidConfig)
 	}
 	return nil
 }
@@ -207,11 +218,17 @@ func Run(ctx context.Context, client kubernetes.Interface, cfg Config) error {
 	// 않는다. 옵션이 켜져 있으면 여기서 기다려, 같은 프로세스가 Run 반환 뒤 곧바로
 	// 재경쟁할 때 이전 리더 작업이 다음 판까지 흐르지 않게 한다.
 	//
-	// 남는 창: acquire 직후 상위 ctx 가 취소되면 renew 가 wait.BackoffUntil 진입부의 ctx
-	// 검사에서 곧바로 반환해, goroutine 이 leaderWorkStarted 를 세팅하기 전에 elector.Run 이
-	// 반환할 수 있다. 그 창은 상위 ctx 가 이미 죽어 RunUntilCancelled 이 다음 판을 열지
-	// 않으므로, 재경쟁 겹침이 아니라 "Run 반환 뒤 리더 작업 시작" 이라는 성격이다.
-	if cfg.WaitForLeaderWork && leaderWorkStarted.Load() {
+	// ctx 가 살아 있다는 건 acquire 가 성공했었다는 뜻이다 - client-go 의 acquire 는 상위 ctx
+	// 가 죽어야만 false 를 반환하기 때문이다. 그러면 OnStartedLeading goroutine 도 이미 떴으니
+	// leaderWorkDone 은 반드시 닫힌다. 즉 이 옵션이 존재하는 이유인 상실 -> 재경쟁 경로는
+	// 플래그를 보지 않아도 대기가 보장된다.
+	//
+	// leaderWorkStarted 는 나머지 경로(상위 ctx 취소) 만 담당한다. 거기서는 acquire 직후
+	// 취소되면 renew 가 wait.BackoffUntil 진입부의 ctx 검사에서 곧바로 반환해, goroutine 이
+	// 플래그를 세우기 전에 elector.Run 이 반환할 수 있다. 그 창은 상위 ctx 가 이미 죽어
+	// RunUntilCancelled 이 다음 판을 열지 않으므로, 재경쟁 겹침이 아니라 "Run 반환 뒤 리더
+	// 작업 시작" 이라는 성격이다.
+	if cfg.WaitForLeaderWork && (ctx.Err() == nil || leaderWorkStarted.Load()) {
 		<-leaderWorkDone
 	}
 
