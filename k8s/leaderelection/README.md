@@ -104,7 +104,7 @@ func RunUntilCancelled(ctx context.Context, client kubernetes.Interface, cfg Con
 | `LeaseDuration` | X | `15s` | 리더가 죽은 뒤 임대를 빼앗기까지의 상한(=failover 지연) |
 | `RenewDeadline` | X | `10s` | 리더가 이 시간 안에 갱신 실패 시 스스로 리더직을 내려놓음 |
 | `RetryPeriod` | X | `2s` | 획득/갱신 재시도 간격 |
-| `WaitForLeaderWork` | X | `false` | true 면 (리더였다면) OnStartedLeading 종료까지 기다린 뒤 반환 - 같은 프로세스 안 겹침만 (함정 5) |
+| `WaitForLeaderWork` | X | `false` | true 면 (리더였다면) OnStartedLeading 종료까지 기다린 뒤 반환 - 종료 시 드레인 + 같은 프로세스 안 겹침 방지 (함정 5) |
 | `OnStartedLeading` | X | nil | 리더가 됐을 때 호출. 넘어온 ctx 는 리더직 상실 시 취소됨 |
 | `OnStoppedLeading` | X | nil | 선출 루프 진입 후 종료 시 항상 호출(리더가 된 적 없어도). 설정 오류로 조기 반환하면 미호출. 정리는 멱등이어야 함 (함정 7) |
 | `OnNewLeader` | X | nil | 관찰된 리더가 바뀔 때마다 호출(관측용) |
@@ -309,8 +309,12 @@ API 의 `metadata.name`(Pod 이름) 을 `POD_NAME` 으로 주입해 쓴다. `cmd
 `Config.WaitForLeaderWork` 를 켜면 `Run` 은 (리더 작업이 시작됐었다면) 그 종료까지 기다린 뒤
 반환한다. 켜기 전에 범위를 정확히 알아야 한다:
 
-- **막아 준다**: 같은 프로세스에서 `RunUntilCancelled` 이 곧바로 시작하는 다음
-  `OnStartedLeading`. 이게 전부다.
+- **드레인을 보장한다**: 종료 경로(SIGTERM 등) 에서도 리더 작업이 시작됐었다면 기다린다.
+  그래서 **"`Run` 이 반환했다 = 리더 작업이 끝났다"** 가 성립한다. 끄면 `Run` 이 곧바로
+  반환하므로, 그 직후 프로세스를 끝내면 리더 작업이 진행 중인 채로 사라진다. 실제 싱글톤
+  작업(외부 쓰기, 배치) 이라면 rejoin 뿐 아니라 **exit 모드에서도 켜야 하는 이유**다.
+- **인프로세스 겹침을 막아 준다**: 같은 프로세스에서 `RunUntilCancelled` 이 곧바로 시작하는
+  다음 `OnStartedLeading` 이 이전 리더 작업과 겹치지 않는다.
 - **막아 주지 않는다**: Lease 반납(함정 3) 과 `OnStoppedLeading`(함정 7) 은 client-go
   `LeaderElector.Run` 안에서 처리돼 이 대기보다 **먼저** 끝난다. 그래서 다른 Pod 는 이전 리더
   작업이 정리를 끝내기 전에 리더가 될 수 있고, `OnStoppedLeading` 도 그 고루틴과 겹칠 수 있다.
@@ -324,7 +328,10 @@ API 의 `metadata.name`(Pod 이름) 을 `POD_NAME` 으로 주입해 쓴다. `cmd
   (`nil`) 로 둔갑하지 않고 `ErrLostLease` 로 남는다.
 
 `cmd` 데모는 rejoin 모드에서만 켠다(`WaitForLeaderWork: *mode == "rejoin"`). `runLeaderWork` 가
-ctx 취소를 확실히 따라 블록 위험이 없고, exit 은 상실 시 프로세스가 죽어 기다릴 이유가 없다.
+ctx 취소를 확실히 따라 블록 위험은 어느 쪽이든 없고, exit 에서 끄는 건 이 데모의 리더 작업이
+**드레인할 상태가 없기** 때문이다(로그만 찍는다). 상실 경로에서는 어차피 프로세스가 죽고, 종료
+경로에서는 중간에 끊겨도 잃을 게 없다. 이 조건은 데모라서 성립하는 것이지 exit 모드의 성질이
+아니다 - 실제 싱글톤 작업이라면 exit 모드에서도 켜는 게 맞다.
 
 어느 쪽을 고르든, 실전 싱글톤 작업이라면 멱등성/펜싱으로 중복 수행을 흡수해야 한다
 (함정 1 과 같은 결론이다). 이 옵션은 겹침 창을 줄여줄 뿐 상호 배제를 보장하지 않는다.

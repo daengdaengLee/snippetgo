@@ -75,7 +75,12 @@ func main() {
 		Identity:  identity,
 		// rejoin 모드에서만 켠다. 상실 직후 재획득할 때 이전 리더 작업이 다음 판까지 흐르는
 		// 것을 줄인다(범위와 한계는 README 함정 5). runLeaderWork 가 ctx 취소를 확실히
-		// 따르므로 블록 위험이 없고, exit 모드는 상실 시 프로세스가 죽어 기다릴 이유가 없다.
+		// 따르므로 블록 위험이 없다.
+		//
+		// exit 모드에서 끄는 건 이 데모의 리더 작업이 드레인할 상태가 없기 때문이다(로그만
+		// 찍는다). 즉 상실 경로에서는 어차피 프로세스가 죽고, 종료 경로에서는 중간에 끊겨도
+		// 잃을 게 없다. 실제 싱글톤 작업이라면 exit 모드에서도 켜야 한다 - 이 옵션이 없으면
+		// SIGTERM 뒤 Run 이 곧바로 반환해, 작업이 진행 중인 채로 프로세스가 끝난다.
 		WaitForLeaderWork: *mode == "rejoin",
 		OnStartedLeading: func(ctx context.Context) {
 			log.Printf("[%s] started leading - 여기서 싱글톤 작업을 돌린다", identity)

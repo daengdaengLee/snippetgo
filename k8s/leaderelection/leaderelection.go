@@ -78,10 +78,16 @@ type Config struct {
 	// 경우(ctx 는 살아 있다) 에는 대기가 보장된다 - 건너뛰는 경로는 ctx 가 이미 죽어 다음
 	// 판 자체가 없는 경우뿐이다.
 	//
-	// 이 대기가 막아 주는 겹침은 하나뿐이다 - 같은 프로세스에서 RunUntilCancelled 이 곧바로
-	// 시작하는 다음 OnStartedLeading. Lease 반납과 OnStoppedLeading 은 client-go 안에서 이
-	// 대기보다 먼저 끝나므로 다른 프로세스와의 겹침은 그대로 남는다(범위와 대가는 README
-	// 함정 5).
+	// 이 대기가 주는 것은 둘이다.
+	//   - 드레인: 종료 경로(SIGTERM 등) 에서도 리더 작업이 시작됐었다면 기다린다. 그래서
+	//     "Run 이 반환했다 = 리더 작업이 끝났다" 가 성립한다. 끄면 Run 반환 직후 프로세스를
+	//     끝낼 때 리더 작업이 진행 중인 채로 사라질 수 있다.
+	//   - 인프로세스 겹침 방지: 같은 프로세스에서 RunUntilCancelled 이 곧바로 시작하는 다음
+	//     OnStartedLeading 이 이전 리더 작업과 겹치지 않는다.
+	//
+	// 막아 주지 않는 것은 다른 프로세스와의 겹침이다. Lease 반납과 OnStoppedLeading 은
+	// client-go 안에서 이 대기보다 먼저 끝나므로, 다음 리더는 이전 리더 작업이 정리를
+	// 끝내기 전에 리더가 될 수 있다(범위와 대가는 README 함정 5).
 	//
 	// 기본값 false 는 client-go 동작(콜백을 별도 goroutine 으로 띄우고 기다리지 않음) 을
 	// 그대로 노출한다. true 로 켜면 콜백이 넘어온 ctx 취소를 존중하지 않을 때 Run 이 무한히
@@ -231,8 +237,9 @@ func Run(ctx context.Context, client kubernetes.Interface, cfg Config) error {
 	exitErr := ctx.Err()
 
 	// client-go 는 OnStartedLeading 을 별도 goroutine 으로 띄우고 그 종료를 기다리지
-	// 않는다. 옵션이 켜져 있으면 여기서 기다려, 같은 프로세스가 Run 반환 뒤 곧바로
-	// 재경쟁할 때 이전 리더 작업이 다음 판까지 흐르지 않게 한다.
+	// 않는다. 옵션이 켜져 있으면 여기서 기다려 둘을 보장한다 - 종료 경로에서는 "Run 반환 =
+	// 리더 작업 종료"(드레인) 이고, 같은 프로세스가 Run 반환 뒤 곧바로 재경쟁할 때는 이전
+	// 리더 작업이 다음 판까지 흐르지 않는다.
 	//
 	// exitErr == nil 은 acquire 가 성공했었다는 뜻이다 - client-go 의 acquire 는 상위 ctx
 	// 가 죽어야만 false 를 반환하기 때문이다. 그러면 OnStartedLeading goroutine 도 이미 떴으니
