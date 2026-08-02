@@ -1,0 +1,46 @@
+# 리더 선출(resourcelock.LeaseLock)은 단일 Lease 오브젝트에 대해 get(상태 확인)/
+# create(최초 생성)/update(갱신, 반납) 만 한다. list/watch/patch 는 쓰지 않으므로 넣지 않는다.
+# coordination.k8s.io 의 leases 에 대한 이 세 권한만 있으면 되고, EventRecorder 를 안 써서
+# events 권한도 필요 없다.
+#
+# 최소 권한은 verb 와 resource 두 축이다. verb 는 위 세 개로 좁히고, resource 는 아래에서
+# resourceNames 로 Lease 이름 하나까지 좁힌다. 규칙이 둘인 이유는 create 를 resourceNames 로
+# 좁힐 수 없기 때문이다(생성 시점엔 그 이름의 오브젝트가 아직 없다).
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: leaderelection
+  namespace: snippetgo-leaderelection
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: leaderelection
+  namespace: snippetgo-leaderelection
+rules:
+  # make break-renew 가 이 규칙(rules[0])의 verbs 를 patch 해 update 를 회수한다.
+  # 규칙 순서를 바꾸면 그 타깃의 JSON Patch test op 가 실패하니 같이 고칠 것.
+  # resourceNames 는 deployment.yaml 의 LEASE_NAME 과 반드시 같아야 한다 -
+  # 어긋나면 Forbidden 으로 아무도 리더가 되지 못한다.
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    resourceNames: ["snippetgo-leaderelection"]
+    verbs: ["get", "update"]
+  # create 는 resourceNames 로 좁힐 수 없다(생성 시점엔 이름이 아직 없다).
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: leaderelection
+  namespace: snippetgo-leaderelection
+subjects:
+  - kind: ServiceAccount
+    name: leaderelection
+    namespace: snippetgo-leaderelection
+roleRef:
+  kind: Role
+  name: leaderelection
+  apiGroup: rbac.authorization.k8s.io

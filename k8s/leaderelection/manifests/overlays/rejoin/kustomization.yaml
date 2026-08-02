@@ -1,0 +1,9 @@
+# rejoin overlay: base 를 그대로 쓰되 LE_MODE 만 rejoin 으로 바꾼다.
+# 배포: make deploy-rejoin (이미지 적재를 포함한다. imagePullPolicy 가 Never 라
+# 맨 kubectl apply -k 는 노드에 이미지가 없으면 ErrImageNeverPull 로 멈춘다)
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../base
+patches:
+  - path: patch-mode.yaml

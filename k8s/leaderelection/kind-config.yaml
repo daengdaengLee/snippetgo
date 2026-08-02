@@ -1,0 +1,6 @@
+# 단일 노드 kind 클러스터. 리더 선출 데모에는 노드 하나면 충분하다
+# (경쟁 주체는 노드가 아니라 Pod replica 다).
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  - role: control-plane

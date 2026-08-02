@@ -1,0 +1,68 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: leaderelection
+  namespace: snippetgo-leaderelection
+  labels:
+    app: leaderelection
+spec:
+  # replica 3 개가 하나의 Lease 를 두고 경쟁한다. 그중 하나만 리더가 된다.
+  replicas: 3
+  selector:
+    matchLabels:
+      app: leaderelection
+  template:
+    metadata:
+      labels:
+        app: leaderelection
+    spec:
+      serviceAccountName: leaderelection
+      # Pod 삭제(SIGTERM) 부터 SIGKILL 까지의 상한이다. 비자발적 상실과는 무관하다.
+      # 이 데모의 종료 경로는 Lease 반납 한 번뿐이라 기본 30s 를 기다릴 이유가 없다.
+      # 다만 client-go 의 반납은 RenewDeadline(기본 10s) 을 타임아웃으로 쓰므로 이 값이
+      # 10s 면 최악의 경우 반납 타임아웃과 SIGKILL 이 겹쳐 함정 3 의 빠른 failover 를
+      # 잃는다. RenewDeadline 보다 넉넉히 크게 잡는다. 상한일 뿐이라 롤아웃은 느려지지
+      # 않는다 - SIGTERM 을 받은 프로세스는 반납 뒤 즉시 끝난다.
+      terminationGracePeriodSeconds: 20
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: leaderelection
+          image: snippetgo/leaderelection:dev
+          # Never: kind 노드에 make load 로 심은 이미지만 쓴다. 레지스트리를 아예
+          # 조회하지 않으므로, 이미지가 없으면 엉뚱한 걸 당겨오는 대신
+          # ErrImageNeverPull 로 멈춘다(결정론적 실패).
+          imagePullPolicy: Never
+          env:
+            # identity 로 쓸 Pod 이름을 Downward API 로 주입한다(그룹 내 유일).
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            # rbac.yaml Role 의 resourceNames 와 반드시 같아야 한다 - 어긋나면
+            # Lease get/update 가 Forbidden 이라 아무도 리더가 되지 못한다.
+            - name: LEASE_NAME
+              value: snippetgo-leaderelection
+            # 리더직 상실 처리 방식(exit | rejoin). base 는 exit 이고,
+            # overlays/rejoin 이 kustomize 패치로 이 값을 rejoin 으로 덮어쓴다.
+            - name: LE_MODE
+              value: exit
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi

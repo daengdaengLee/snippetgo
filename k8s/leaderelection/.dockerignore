@@ -1,0 +1,4 @@
+# 이미지는 make build 산출물(bin/leaderelection) 하나만 필요하다.
+# 소스/매니페스트/문서는 빌드 컨텍스트에서 제외한다.
+*
+!bin

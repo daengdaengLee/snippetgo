@@ -1,0 +1,14 @@
+# 전략 병합 패치. env 리스트는 name 키로 병합되므로 LE_MODE 만 바뀌고 나머지는 보존된다.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: leaderelection
+  namespace: snippetgo-leaderelection
+spec:
+  template:
+    spec:
+      containers:
+        - name: leaderelection
+          env:
+            - name: LE_MODE
+              value: rejoin
