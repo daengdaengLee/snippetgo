@@ -113,10 +113,17 @@ func RunUntilCancelled(ctx context.Context, client kubernetes.Interface, cfg Con
 
 | 반환 | 언제 |
 | --- | --- |
-| `nil` | `ctx` 가 정상 취소되어 종료 |
+| `nil` | `ctx` 가 정상 취소(`context.Canceled`)되어 종료 |
 | `ErrLostLease` | (`Run` 한정) 리더였다가 갱신 실패로 리더직을 비자발적으로 상실 |
 | `ErrInvalidConfig` | `Namespace`/`LeaseName`/`Identity` 중 하나라도 비었을 때 |
-| 그 외 에러 | 타이밍 관계식 위반, 클라이언트 생성 실패 등 |
+| `ctx.Err()` | `ctx` 가 취소가 아닌 사유로 끝났을 때(데드라인 만료 등). 정상 종료(`nil`)와 뭉뚱그리지 않는다 |
+| 그 외 에러 | 타이밍 관계식 위반 - client-go `NewLeaderElector` 의 에러를 그대로 전달한다 (함정 2) |
+
+위 표에 없는 실패는 **에러로 반환되지 않는다.** RBAC `Forbidden`(예: Role 의 `resourceNames` 와
+`LEASE_NAME` 불일치)이나 잘못된 Lease 이름처럼 획득 자체가 계속 거부되는 경우, client-go 의
+`acquire` 는 실패해도 반환하지 않고 `RetryPeriod` 간격으로 무한 재시도한다. 그래서 `Run` 은
+반환하지 않은 채 **블록한 상태로 남고**, 증상은 로그(`Error retrieving resource lock`)로만
+드러난다. "리더 선출이 조용히 아무 일도 안 한다" 면 반환값이 아니라 Pod 로그를 봐야 한다.
 
 반환값은 client-go 선출 루프가 반환한 시점에 확정된다. 그래서 `WaitForLeaderWork` 대기가
 길어지는 동안 `ctx` 가 취소돼도 비자발적 상실은 `nil` 이 아니라 `ErrLostLease` 로 그대로 나온다.
