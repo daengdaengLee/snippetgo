@@ -122,8 +122,10 @@ func RunUntilCancelled(ctx context.Context, client kubernetes.Interface, cfg Con
 위 표에 없는 실패는 **에러로 반환되지 않는다.** RBAC `Forbidden`(예: Role 의 `resourceNames` 와
 `LEASE_NAME` 불일치)이나 잘못된 Lease 이름처럼 획득 자체가 계속 거부되는 경우, client-go 의
 `acquire` 는 실패해도 반환하지 않고 `RetryPeriod` 간격으로 무한 재시도한다. 그래서 `Run` 은
-반환하지 않은 채 **블록한 상태로 남고**, 증상은 로그(`Error retrieving resource lock`)로만
+반환하지 않은 채 **블록한 상태로 남고**, 증상은 로그(`Error retrieving lease lock`)로만
 드러난다. "리더 선출이 조용히 아무 일도 안 한다" 면 반환값이 아니라 Pod 로그를 봐야 한다.
+(client-go v0.36.3 기준 문자열이다. 한 글자 다른 `Error retrieving resource lock` 도 있지만
+그건 반납(`release`) 경로의 로그라 이 상황에서는 나오지 않는다 - grep 할 때 헷갈리기 쉽다.)
 
 반환값은 client-go 선출 루프가 반환한 시점에 확정된다. 그래서 `WaitForLeaderWork` 대기가
 길어지는 동안 `ctx` 가 취소돼도 비자발적 상실은 `nil` 이 아니라 `ErrLostLease` 로 그대로 나온다.
@@ -259,7 +261,8 @@ make fix-renew      # 복구
 ## 함정 모음
 
 아래 서술 중 client-go 내부 동작에 기대는 부분(함정 3/5/7)은 **client-go v0.36.3** 소스로 확인한
-것이다. 업그레이드할 때는 그 세 항목을 다시 확인할 것.
+것이다. 업그레이드할 때는 그 세 항목과 위 "에러 계약" 절이 인용한 로그 문자열을 다시 확인할 것
+(로그 메시지는 API 가 아니라 버전 사이에 조용히 바뀐다).
 
 ### 1. 리더 선출은 상호 배제(fencing) 가 아니다 - 설명만
 
