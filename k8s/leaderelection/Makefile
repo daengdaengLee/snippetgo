@@ -4,6 +4,11 @@
 # 그다음 make logs 로 한 Pod 만 리더가 되는 것을 관찰한다.
 
 CLUSTER ?= snippetgo-le
+# 이 Makefile 은 kind 전용이다. current-context 를 따라가면 컨텍스트를 바꾼 뒤 부른
+# break-renew 가 엉뚱한 클러스터의 RBAC 를 훼손하고 kill-leader 가 남의 Pod 를 지운다.
+# kind 는 컨텍스트를 kind-<name> 으로 만드므로 거기에 고정한다. 클러스터가 없을 때도
+# "connection refused" 대신 "context does not exist" 로 원인이 분명해진다.
+KUBECTL := kubectl --context kind-$(CLUSTER)
 # 배포할 kustomize 디렉터리. base 는 exit, overlays/rejoin 은 rejoin 모드.
 KUSTOMIZE_DIR ?= manifests/base
 # 아래 세 값은 manifests/ 의 값을 미러링하는 상수다(매니페스트가 source of truth).
@@ -59,9 +64,9 @@ load: docker-build ## 이미지 빌드 후 kind 노드에 적재
 # 이미지로 갈아치운다.
 .PHONY: deploy
 deploy: load ## 빌드/적재 -> apply -> Pod 재시작 -> 롤아웃 대기(kind 클러스터 필수)
-	kubectl apply -k $(KUSTOMIZE_DIR)
-	kubectl -n $(NAMESPACE) rollout restart deploy/leaderelection
-	kubectl -n $(NAMESPACE) rollout status deploy/leaderelection --timeout=90s
+	$(KUBECTL) apply -k $(KUSTOMIZE_DIR)
+	$(KUBECTL) -n $(NAMESPACE) rollout restart deploy/leaderelection
+	$(KUBECTL) -n $(NAMESPACE) rollout status deploy/leaderelection --timeout=90s
 
 .PHONY: deploy-rejoin
 deploy-rejoin: ## 클러스터 재생성 없이 rejoin overlay 재배포(빌드/적재/Pod 재시작 포함)
@@ -69,37 +74,38 @@ deploy-rejoin: ## 클러스터 재생성 없이 rejoin overlay 재배포(빌드/
 
 .PHONY: status
 status: ## Lease 와 Pod 상태 확인
-	kubectl -n $(NAMESPACE) get lease,pods -o wide
+	$(KUBECTL) -n $(NAMESPACE) get lease,pods -o wide
 
 .PHONY: logs
 logs: ## 모든 Pod 로그를 실시간으로 따라가기(리더 관찰)
-	kubectl -n $(NAMESPACE) logs -l app=leaderelection -f --prefix --max-log-requests=10
+	$(KUBECTL) -n $(NAMESPACE) logs -l app=leaderelection -f --prefix --max-log-requests=10
 
 .PHONY: leader
 leader: ## 현재 리더(Lease holderIdentity) 출력
-	kubectl -n $(NAMESPACE) get lease $(LEASE_NAME) -o jsonpath='{.spec.holderIdentity}{"\n"}'
+	$(KUBECTL) -n $(NAMESPACE) get lease $(LEASE_NAME) -o jsonpath='{.spec.holderIdentity}{"\n"}'
 
 .PHONY: kill-leader
 kill-leader: ## 현재 리더 Pod 를 삭제해 failover 유도
-	@leader=$$(kubectl -n $(NAMESPACE) get lease $(LEASE_NAME) -o jsonpath='{.spec.holderIdentity}'); \
+	@leader=$$($(KUBECTL) -n $(NAMESPACE) get lease $(LEASE_NAME) -o jsonpath='{.spec.holderIdentity}'); \
 	if [ -z "$$leader" ]; then echo "현재 리더 없음(선출 전이거나 홀더 비어 있음)"; exit 1; fi; \
 	echo "리더 Pod 삭제: $$leader"; \
-	kubectl -n $(NAMESPACE) delete pod "$$leader"
+	$(KUBECTL) -n $(NAMESPACE) delete pod "$$leader"
 
 # renew 는 Lease update 이므로 update 만 막으면 ctx 는 살아 있는 채 갱신만 실패한다
 # = API 파티션 없이 비자발적 상실을 재현. rules 는 하나뿐이라 인덱스 0 을 쓴다.
 .PHONY: break-renew
 break-renew: ## Role 에서 update 권한을 회수해 비자발적 리더직 상실 유도
-	kubectl -n $(NAMESPACE) patch role leaderelection --type=json \
+	$(KUBECTL) -n $(NAMESPACE) patch role leaderelection --type=json \
 		-p='[{"op":"replace","path":"/rules/0/verbs","value":["get","create"]}]'
-	@echo "Role 이 훼손된 상태다. 복구: make fix-renew"
-	@echo "  주의: 인수 없는 make deploy 는 base(exit) 를 적용한다. rejoin 유지는 make deploy-rejoin, 최후에는 make demo."
+	@echo "Role 이 훼손된 상태다. 복구: make fix-renew (Deployment 를 건드리지 않아 exit/rejoin 모드는 유지된다)"
 
+# 매니페스트가 source of truth 다. verb 목록을 여기에 다시 적으면 rbac.yaml 이 바뀔 때
+# 조용히 어긋난다. apply 는 3-way merge 로 훼손된 live 값을 매니페스트 값으로 되돌리고,
+# apply -k 와 달리 Deployment 를 건드리지 않아 LE_MODE(exit/rejoin) 가 그대로 남는다.
 .PHONY: fix-renew
-fix-renew: ## update 권한을 복구해 정상 상태로 되돌린다
-	kubectl -n $(NAMESPACE) patch role leaderelection --type=json \
-		-p='[{"op":"replace","path":"/rules/0/verbs","value":["get","create","update"]}]'
-	@echo "update 권한 복구 완료"
+fix-renew: ## rbac.yaml 을 재적용해 update 권한을 복구한다
+	$(KUBECTL) apply -f manifests/base/rbac.yaml
+	@echo "RBAC 복구 완료(rbac.yaml 기준)"
 
 # demo 의 전제조건은 clean kind-up deploy 로 충분하다. deploy: load, load: docker-build,
 # docker-build: build 가 걸려 있어 빌드/적재는 deploy 가 끌고 온다. kind-up 만 목록에

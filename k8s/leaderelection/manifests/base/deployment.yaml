@@ -18,9 +18,12 @@ spec:
     spec:
       serviceAccountName: leaderelection
       # Pod 삭제(SIGTERM) 부터 SIGKILL 까지의 상한이다. 비자발적 상실과는 무관하다.
-      # 이 데모의 종료 경로는 Lease 반납 한 번뿐이라 기본 30s 를 기다릴 이유가 없어 짧게
-      # 준다. 너무 짧으면 반납 전에 SIGKILL 이 와서 함정 3 의 빠른 failover 를 잃는다.
-      terminationGracePeriodSeconds: 10
+      # 이 데모의 종료 경로는 Lease 반납 한 번뿐이라 기본 30s 를 기다릴 이유가 없다.
+      # 다만 client-go 의 반납은 RenewDeadline(기본 10s) 을 타임아웃으로 쓰므로 이 값이
+      # 10s 면 최악의 경우 반납 타임아웃과 SIGKILL 이 겹쳐 함정 3 의 빠른 failover 를
+      # 잃는다. RenewDeadline 보다 넉넉히 크게 잡는다. 상한일 뿐이라 롤아웃은 느려지지
+      # 않는다 - SIGTERM 을 받은 프로세스는 반납 뒤 즉시 끝난다.
+      terminationGracePeriodSeconds: 20
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532
