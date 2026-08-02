@@ -148,8 +148,12 @@ func RunUntilCancelled(ctx context.Context, client kubernetes.Interface, cfg Con
 | `make leader` | 현재 리더(`Lease.holderIdentity`) 출력 |
 | `make kill-leader` | 현재 리더 Pod 삭제 -> failover 유도 |
 | `make break-renew` | Role 에서 `update` 회수 -> 비자발적 리더직 상실 유도 (함정 6) |
-| `make fix-renew` | `update` 권한 복구 |
+| `make fix-renew` | `rbac.yaml` 재적용으로 `update` 권한 복구 |
 | `make clean` | 클러스터/로컬 이미지/바이너리 정리 |
+
+모든 `kubectl` 호출은 `--context kind-snippetgo-le` 로 고정돼 있다. 이 Makefile 은 kind 전용이라
+current-context 를 따라갈 이유가 없고, 따라가면 컨텍스트를 바꿔 둔 채 부른 `break-renew` 가
+엉뚱한 클러스터의 RBAC 를 훼손하고 `kill-leader` 가 남의 Pod 를 지운다.
 
 리더직 상실 처리 방식(`LE_MODE`)은 kustomize 로 고른다. base(`manifests/base`)는 `exit`,
 `manifests/overlays/rejoin` overlay 가 `rejoin` 으로 덮어쓴다. `make deploy` 는 빌드 -> kind
@@ -209,10 +213,9 @@ make fix-renew      # 복구
 ```
 
 `break-renew` 는 Role 을 훼손된 상태로 남긴다. 복구하지 않으면 그 클러스터에서는 **어떤 Pod 도
-리더가 될 수 없다.** 복구는 `make fix-renew` 가 1순위다. `kubectl apply -k` 도 `rbac.yaml` 을
-재적용해 원복하지만, **인수 없는 `make deploy` 는 base(exit) 를 적용해 rejoin 배포를 exit 으로
-되돌린다** - rejoin 을 유지하려면 `make deploy-rejoin` 을 쓴다. 최후에는 `make demo`(클러스터/
-이미지까지 새로 만든다).
+리더가 될 수 없다.** 복구는 `make fix-renew` 다 - `rbac.yaml` 을 그대로 재적용하므로 verb 목록이
+매니페스트와 어긋날 일이 없고, `apply -k` 와 달리 Deployment 를 건드리지 않아 `LE_MODE`
+(exit/rejoin) 도 그대로 유지된다.
 
 주의: 훼손 중에는 반납(`release`)도 거부되므로 `make leader` 가 옛 홀더 이름을 그대로 보여준다.
 정상처럼 보이니 `RESTARTS` 와 로그로 판단해야 한다. 자세한 차이는 함정 6 에서 설명한다.
@@ -239,6 +242,9 @@ make fix-renew      # 복구
 런타임은 `gcr.io/distroless/static:nonroot`).
 
 ## 함정 모음
+
+아래 서술 중 client-go 내부 동작에 기대는 부분(함정 3/5/7)은 **client-go v0.36.3** 소스로 확인한
+것이다. 업그레이드할 때는 그 세 항목을 다시 확인할 것.
 
 ### 1. 리더 선출은 상호 배제(fencing) 가 아니다 - 설명만
 
@@ -291,8 +297,10 @@ API 의 `metadata.name`(Pod 이름) 을 `POD_NAME` 으로 주입해 쓴다. `cmd
   `LeaderElector.Run` 안에서 처리돼 이 대기보다 **먼저** 끝난다. 그래서 다른 Pod 는 이전 리더
   작업이 정리를 끝내기 전에 리더가 될 수 있고, `OnStoppedLeading` 도 그 고루틴과 겹칠 수 있다.
 - **대가**: 콜백이 ctx 취소를 존중하지 않으면 `Run` 이 무한히 블록한다(그래서 기본값 `false`).
-  또 acquire 직후 상위 ctx 가 취소되면 콜백이 시작 표시를 세우기 전에 `Run` 이 반환해 대기가
-  걸리지 않는다 - 그 창은 상위 ctx 가 이미 죽어 재경쟁이 아니라 "`Run` 반환 뒤 콜백 시작" 이다.
+- **건너뛰는 창**: 상위 ctx 가 이미 취소된 경우 하나뿐이다. client-go 의 acquire 는 상위 ctx 가
+  죽어야만 실패하므로, `Run` 이 돌아온 시점에 ctx 가 살아 있다면 리더 작업 goroutine 은 반드시
+  떠 있고 대기도 반드시 걸린다. 즉 이 옵션이 필요한 **상실 -> 재경쟁 경로에서는 보장**이고,
+  건너뛰는 쪽은 어차피 다음 판이 없어 겹칠 것도 없는 경우다.
 
 `cmd` 데모는 rejoin 모드에서만 켠다(`WaitForLeaderWork: *mode == "rejoin"`). `runLeaderWork` 가
 ctx 취소를 확실히 따라 블록 위험이 없고, exit 은 상실 시 프로세스가 죽어 기다릴 이유가 없다.
@@ -345,6 +353,63 @@ called after OnStartedLeading." 즉 리더가 된 적 없는 팔로워가 종료
 확인). 이 순서 보장은 래퍼가 대신 만들어 줄 수 없다 - OnStartedLeading/OnNewLeader 는 client-go
 가 별도 goroutine 으로 띄우고 OnStoppedLeading 만 메인 goroutine defer 라, "리더였는지" 를 race
 없이 알려주는 동기 신호가 없기 때문이다. 그래서 이 스니펫은 client-go 계약을 그대로 노출한다.
+
+### 8. renew 루프가 멈춘 것은 프로세스 생존으로 알 수 없다 - 미노출
+
+리더가 갱신에 실패하면 client-go 가 `Run` 을 반환하므로 이 스니펫은 그 신호를 `ErrLostLease` 로
+다룬다(함정 6). 하지만 renew 루프 **자체가 멈춰 버린** 경우(deadlock, goroutine 누수 등)에는
+반환도 없고 프로세스도 살아 있어 kubelet 이 보기엔 멀쩡하다. 리더 자리를 쥔 채 아무 일도 하지
+않는 최악의 상태가 조용히 유지된다.
+
+client-go 는 이를 위해 `LeaderElectionConfig.WatchDog`(`leaderelection.NewLeaderHealthzAdaptor`)
+을 제공한다. 마지막 갱신 시각이 기준을 넘으면 `Check` 가 실패하므로, healthz 핸들러에 물려
+liveness probe 로 Pod 를 재시작시킬 수 있다. 이 스니펫은 선출 생명주기 자체에 집중하려고
+`Config` 에 노출하지 않았다 - 실전 배포라면 고려할 것.
+
+## 테스트 전략
+
+`go test -race -count=10` 을 통과하는 결정적 테스트 13개. 클러스터 없이 **선출 루프를 실제로
+돌린다.**
+
+**fake clientset 의 reactor 로 renew 실패를 만든다.** 이 스니펫에서 제일 쓸모 있는 기법이다.
+`k8s.io/client-go/kubernetes/fake` 는 Lease 를 get/create/update 하는 경로를 그대로 태워 주고,
+`PrependReactor` 로 그중 `update` 만 가로채면 **ctx 는 살려둔 채 갱신만 실패**시킬 수 있다.
+
+```go
+c.PrependReactor("update", "leases", func(k8stesting.Action) (bool, runtime.Object, error) {
+    if b.fail.Load() {
+        return true, nil, apierrors.NewConflict(...) // 갱신 실패 -> 비자발적 상실
+    }
+    return false, nil, nil // 기본 트래커로 넘긴다
+})
+```
+
+`make break-renew` 가 Role 에서 `update` verb 만 회수하는 것과 정확히 같은 원리다. renew 는 Lease
+`update` 이므로, API 파티션이나 시계 조작 없이 "리더가 임대를 놓치는" 상황을 만들 수 있다.
+클러스터 실험과 단위 테스트가 같은 지렛대를 쓴다.
+
+**상실 확정은 `OnStoppedLeading` 으로 붙잡는다.** `time.Sleep(600ms)` 으로 "이쯤이면 상실됐겠지"
+하고 넘기면 느린 머신에서 아직 리더인 채로 갱신을 다시 허용해, 재획득이 일어나지 않고 테스트가
+타임아웃으로 죽는다. client-go 는 이 콜백을 `LeaderElector.Run` 의 `defer` 로 부르므로 **불렸다는
+것 자체가 "renew 가 이미 포기했다" 는 확정 신호**다. 판정에 영향을 주는 sleep 은 쓰지 않는다.
+
+**예외인 sleep 하나.** `WaitForLeaderWork` 테스트의 콜백 안에는 정리 지연을 흉내 내는
+`time.Sleep(400ms)` 이 있다. 이건 남겨도 된다 - 느린 머신에서는 겹침 창이 **넓어지므로** 거짓
+통과가 아니라 거짓 실패 방향이고, 깨진 구현이 오히려 더 잘 잡힌다.
+
+**타이밍 값은 관계식이 허락하는 최소로.** 헬퍼의 `fastConfig` 는 300ms/200ms/50ms 를 쓴다.
+기본값(15s/10s/2s)으로는 테스트가 못 돈다. `RetryPeriod * JitterFactor(1.2) < RenewDeadline <
+LeaseDuration` 을 지키는 선에서 최대한 줄인 값이다(함정 2).
+
+**역방향은 단언하지 않는다.** "`WaitForLeaderWork` 를 끄면 겹침이 **발생한다**" 는 단언하지
+않는다. 재획득 속도에 따라 안 겹칠 수도 있는 타이밍 의존 현상이라 flaky 해진다. 이 옵션은
+"켜면 동시 실행이 1 을 넘지 않는다" 한 방향만 고정한다.
+
+**계약도 테스트로 고정한다.** 함정 7(`OnStoppedLeading` 은 리더가 된 적 없어도 불린다)은 미리
+취소한 ctx 로 `Run` 을 불러 `OnStartedLeading` 0 회 / `OnStoppedLeading` 1 회로 확인한다. 함정 3
+(`ReleaseOnCancel` 반납)은 취소 후 `holderIdentity` 가 빈 문자열이 되는지로 확인한다. 타이밍
+관계식 검증을 client-go 에 위임한 것(함정 2)도 `Run` 이 `NewLeaderElector` 의 에러를 그대로
+돌려주는지로 고정한다.
 
 ## 참고 자료
 
