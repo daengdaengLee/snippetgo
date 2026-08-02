@@ -181,6 +181,10 @@ func Run(ctx context.Context, client kubernetes.Interface, cfg Config) error {
 
 	elector, err := k8sle.NewLeaderElector(k8sle.LeaderElectionConfig{
 		Lock: lock,
+		// 선출 동작에는 영향이 없고 식별용으로만 쓰인다 - client-go 의 메트릭 라벨과
+		// WatchDog(Check) 실패 메시지("failed election to renew leadership on lease %s").
+		// 비워 두면 함정 8 대로 WatchDog 을 붙였을 때 그 메시지의 이름이 빈칸으로 나온다.
+		Name: cfg.LeaseName,
 		// 이름은 "OnCancel" 이지만 client-go 는 renew 루프를 빠져나온 뒤 종료 사유를 구분하지
 		// 않고 반납을 시도한다 - 비자발적 상실에서도 돈다. failover 를 빠르게 하려고 켜되,
 		// 반납 자체는 best effort 로 본다(README 함정 3).
