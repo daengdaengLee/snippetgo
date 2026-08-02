@@ -94,8 +94,10 @@ type Config struct {
 	// 취소되면 리더 작업이 끝난 것으로 본다.
 	OnStartedLeading func(ctx context.Context)
 	// OnStoppedLeading 은 리더 전용 자원을 정리하는 자리다. 단, client-go 계약상 이 콜백은
-	// Run 이 끝날 때 항상 호출된다 - 이 인스턴스가 리더가 된 적 없어도(팔로워가 종료해도)
-	// 불린다. OnStartedLeading 이 먼저 불렸다고 가정하지 말고, 정리 로직은 멱등이어야 한다.
+	// 선출 루프에 진입한 뒤 종료할 때 항상 호출된다 - 이 인스턴스가 리더가 된 적 없어도
+	// (팔로워가 종료해도) 불린다. 설정이 잘못돼 Run 이 선출 루프 진입 전에 반환하는 경우
+	// (ErrInvalidConfig, 타이밍 관계식 위반) 는 예외로, 이때는 불리지 않는다.
+	// OnStartedLeading 이 먼저 불렸다고 가정하지 말고, 정리 로직은 멱등이어야 한다.
 	// 또 이 콜백은 WaitForLeaderWork 대기보다 먼저 불리므로, 여기서 닫는 자원을 리더 작업
 	// goroutine 이 아직 쓰고 있을 수 있다.
 	OnStoppedLeading func()

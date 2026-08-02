@@ -106,7 +106,7 @@ func RunUntilCancelled(ctx context.Context, client kubernetes.Interface, cfg Con
 | `RetryPeriod` | X | `2s` | 획득/갱신 재시도 간격 |
 | `WaitForLeaderWork` | X | `false` | true 면 (리더였다면) OnStartedLeading 종료까지 기다린 뒤 반환 - 같은 프로세스 안 겹침만 (함정 5) |
 | `OnStartedLeading` | X | nil | 리더가 됐을 때 호출. 넘어온 ctx 는 리더직 상실 시 취소됨 |
-| `OnStoppedLeading` | X | nil | Run 종료 시 항상 호출(리더가 된 적 없어도). 정리는 멱등이어야 함 (함정 7) |
+| `OnStoppedLeading` | X | nil | 선출 루프 진입 후 종료 시 항상 호출(리더가 된 적 없어도). 설정 오류로 조기 반환하면 미호출. 정리는 멱등이어야 함 (함정 7) |
 | `OnNewLeader` | X | nil | 관찰된 리더가 바뀔 때마다 호출(관측용) |
 
 에러 계약:
