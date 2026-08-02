@@ -158,7 +158,7 @@ func TestRunAcquiresLeadership(t *testing.T) {
 	defer cancel()
 
 	errCh := make(chan error, 1)
-	go func() { errCh <- Run(ctx, newRenewBlocker().client, cfg) }()
+	go func() { errCh <- Run(ctx, fake.NewClientset(), cfg) }()
 
 	awaitCount(t, &started, 1, 5*time.Second, "OnStartedLeading")
 	cancel()
@@ -257,8 +257,11 @@ func TestRunReturnsErrLostLeaseOnRenewFailure(t *testing.T) {
 		<-ctx.Done()
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	errCh := make(chan error, 1)
-	go func() { errCh <- Run(context.Background(), blocker.client, cfg) }()
+	go func() { errCh <- Run(ctx, blocker.client, cfg) }()
 
 	awaitCount(t, &started, 1, 5*time.Second, "OnStartedLeading")
 	blocker.Block() // 이제부터 갱신 실패 -> 리더직 비자발적 상실
